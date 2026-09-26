@@ -1,0 +1,327 @@
+#+TITLE: Determinism spike — can Tuxemon replay deterministically?
+#+DATE: 2026-08-25
+
+* The question
+
+Can two headless Tuxemon runs, from the same seed and the same step-indexed
+input schedule, reach byte-identical game state — and does the comparison
+actually discriminate?
+
+The answer decides whether the eval platform can ~verify~ by equality (the
+=supertux-ghosts= model) or must grade by outcome-equivalence instead.
+
+*Answer: yes, byte-identical replay is achievable, and it is cheap.* Two small
+defects block it today; a third (wall-clock leakage) is real but unaddressed by
+this probe. *Combat determinism has since been verified* — see
+[[*Gate 2 — determinism through an actual battle]]. Everything measured is scoped
+in [[*What was NOT measured]].
+
+Upstream is at =59a3416= and *was not modified*. Every fix below was applied by
+external monkeypatching from =spike/=, so the numbers describe stock Tuxemon.
+
+* Gate 0 — headless does not play the game as shipped
+
+=main.headless()= pushes only =HeadlessServerState=, whose =process_event=
+returns =None= and which never loads a world. It is a server shell, not a
+playable client.
+
+Worse, =prepare.headless_init()= cannot load *any* graphical asset:
+
+- it never calls =pg.init()=, so =pygame_menu= trips its own
+  ~assert pygame.get_init()~;
+- it never calls =pg.display.set_mode()=, so the first sprite load dies in
+  =pytmx.util_pygame.smart_convert= with
+  ~pygame.error: No convert format has been set~.
+
+Creating the player NPC loads a sprite sheet, so *stock headless cannot create a
+player*. Three lines fix it (=pg.init()=, =pg.display.set_mode()=, dummy
+driver). With those, headless runs the real game: the intro sequence fires,
+dialogs push =ChoiceState= / =ImageState=, the player walks, and map
+transitions work (=start_tuxemon.tmx= → =spyder_paper_scoop.tmx=).
+
+* Gate 1 — what actually breaks determinism
+
+Measured over 9 runs at 1500 steps, then 5 more with a forced party generation.
+
+** Finding 1: one unseeded instance RNG (blocking, trivial)
+
+All 152 gameplay RNG calls in the walking route were =inst.random= — calls on a
+=random.Random= *instance*, not the module global. =random.seed()= does not
+touch those, so they draw from OS entropy and ignore the seed completely.
+
+There is *exactly one* instance-RNG site in the whole codebase:
+
+: tuxemon/world/weather.py:133
+:     random.Random(seed) if seed is not None else random.Random()
+
+constructed seedless at =tuxemon/base_client.py:189= as
+=WorldWeatherManager()=. It already accepts a =seed= parameter — nothing needs
+inventing, the seed just has to be passed.
+
+** Finding 2: uuid4() bypasses the RNG entirely (blocking, small)
+
+With weather seeded, three same-seed runs still diverged. Diffing the full
+state showed *exactly one* differing field:
+
+: game_variables["add_monster"] : cd9341e5... vs 87f22a58...
+
+That is a monster =instance_id=. =uuid4()= draws from OS entropy, not =random=.
+11 call sites, the load-bearing ones being =entity/entity.py:218=,
+=battle.py:29=, =technique/technique.py:56=, =status/status.py:46=,
+=session.py:42=. Routing them through a seeded =Random.getrandbits(128)= closes
+it.
+
+** Result after both fixes
+
+| label | seed | PYTHONHASHSEED | state_sha          | party HP  |
+|-------+------+----------------+--------------------+-----------|
+| F1    | 1234 |              0 | =6e339c71bf893478= | [111, 75] |
+| F2    | 1234 |              0 | =6e339c71bf893478= | [111, 75] |
+| F3    | 1234 |              0 | =6e339c71bf893478= | [111, 75] |
+| FH3   | 1234 |              3 | =6e339c71bf893478= | [111, 75] |
+| F7    |    7 |              0 | =f7014a80953d5c58= | [97, 69]  |
+
+Byte-identical across repeats *and* across =PYTHONHASHSEED=, and different under
+a different seed. Set iteration order is not a factor.
+
+** The digest had to be proven, not assumed
+
+The first version of this probe reported "deterministic" for *nine* runs
+including unseeded ones and three different seeds — all the same hash. That was
+worthless: the route never moved the player, and the digest was blind to the
+state stack, the only thing changing. Two controls fixed it:
+
+1. *Instrument =random= itself.* Call counts revealed 152 live calls the state
+   digest could not see.
+2. *Vary the seed and require divergence.* Only once party HP moved
+   ([111,75] → [97,69] → [110,70]) was the digest known to discriminate.
+
+Per =supertux-ghosts/CLAUDE.md=: a check that cannot fail proves nothing. This
+one was made to fail before it was believed.
+
+** Control flow is already deterministic
+
+RNG call *counts* were identical in every run — 152 intro, 26 party, 30 battle,
+every time, seeded or not. Only the values varied. Tuxemon's control flow does
+not branch on wall clock in the paths exercised, which is why seeding alone is
+sufficient rather than needing an execution-order rewrite.
+
+* Gate 2 — determinism through an actual battle
+
+The first pass of this spike could not enter combat, so combat determinism was
+reported as unverified. It has now been measured, and it holds.
+
+** Getting into a battle headless takes three non-obvious steps
+
+1. *Unwind the intro.* The opening sequence on =start_tuxemon.tmx= leaves a
+   blocking =InputMenu= (player-name text entry) that A-mashing cannot dismiss.
+   While it is up the world never becomes interactive.
+2. *Set an environment.* =RandomBattleAction._start_battle= returns early when
+   =environment_manager.get_active_environment()= is =None=. It reports this via
+   =logger.error=, so with logging unconfigured *the battle refuses in total
+   silence*. =set_environment grass= fixes it.
+3. *Invoke with =skip=True=.* See the deadlock below.
+
+** =EventAction.run()= is a wall-clock spin loop (determinism hazard)
+
+Calling =execute_action("random_battle", ...)= normally *hangs headless
+forever*. =eventaction.py:178= is:
+
+: while not self.done and not self.cancelled:
+:     now = time.perf_counter()
+:     dt = now - last_time
+:     self.update(session, dt)
+
+It never advances the client, so =CombatState= cannot progress and the action
+can never finish. Its own docstring admits it "may cause the game to hang if an
+action is waiting on game changes."
+
+Two consequences for S1, and the second is the important one:
+
+- Probes must pass =skip=True= (runs =start()=, no spin).
+- *Every non-instant event action is driven by wall-clock =dt= from
+  =time.perf_counter()=, outside the fixed-timestep loop.* The fixed 1/60 tick
+  in =HeadlessClient.main()= does not govern action updates at all. Any action
+  whose behaviour depends on =dt= is machine-speed dependent. This did not
+  surface as divergence in the runs below, but it is a live hazard and S1 should
+  route action updates through the same step clock.
+
+** Result: combat is deterministic
+
+2000 steps, battle in progress, real damage dealt:
+
+| label | seed | PYTHONHASHSEED | rng in battle | state_sha          | party HP |
+|-------+------+----------------+---------------+--------------------+----------|
+| K1    | 1234 |              0 |            49 | =271508d5b6ffcca9= | [90, 75] |
+| K2    | 1234 |              0 |            49 | =271508d5b6ffcca9= | [90, 75] |
+| K3    | 1234 |              0 |            49 | =271508d5b6ffcca9= | [90, 75] |
+| KH5   | 1234 |              5 |            49 | =271508d5b6ffcca9= | [90, 75] |
+| K7    |    7 |              0 |            53 | =b0d9c5ca2b07c6b3= | [75, 69] |
+| K99   |   99 |              0 |            43 | =dbf4627cae949316= | [31, 70] |
+
+Note the *RNG call counts differ across seeds* (49 / 53 / 43). Unlike the
+walking route, combat control flow genuinely branches on RNG — which is exactly
+why this was the gap worth closing. The digest discriminates strongly: three
+different damage outcomes.
+
+Extending to 20000 steps (~5.5 minutes of game time, 109 combat RNG calls):
+
+| label | seed | state_sha          | party HP |
+|-------+------+--------------------+----------|
+| L1    | 1234 | =d0afa92bc336c237= | [23, 75] |
+| L2    | 1234 | =d0afa92bc336c237= | [23, 75] |
+
+Byte-identical.
+
+** One probe artifact, not a game defect
+
+The 20000-step run at seed 7 crashed with
+~ValueError: Missing state SinkState~. The probe's intro bypass pops *every*
+state above =WorldState=, including =SinkState=, which a later action expects.
+Seed 7 takes a different combat path and reaches that action. This is a defect
+in the crude bypass, not evidence of nondeterminism — but it does mean *the real
+executor needs a principled way to start from a defined world*, not a stack
+unwind. Loading a save is the obvious answer.
+
+* Gate 3 — depth: 120000 steps, and the last leak
+
+Extending to 120000 steps (~33 minutes of game time) drives the *post-battle
+reward path*: monsters level up (12→13, 10→14), experience accrues
+([2240, 3197]), battle winnings pay out (money 500→733), and one party member
+faints. ~88,700 RNG calls, versus 109 at 20000 steps.
+
+At that depth the state hash *stopped matching* across same-seed runs, while
+every gameplay-visible outcome stayed identical:
+
+| label | seed | RNG calls | state_sha    | HP       | levels   | exp          | money |
+|-------+------+-----------+--------------+----------+----------+--------------+-------|
+| E2    | 1234 |     88671 | =fbe3580c…= | [0, 82]  | [13, 14] | [2240, 3197] |   733 |
+| E3    | 1234 |     88671 | =ba3a955d…= | [0, 82]  | [13, 14] | [2240, 3197] |   733 |
+| EH9   | 1234 |     88671 | =47b4244e…= | [0, 82]  | [13, 14] | [2240, 3197] |   733 |
+| E7    |    7 |     92296 | =624d3809…= | [41, 69] | [16, 10] | [4787, 1000] |   765 |
+
+Rather than guess, two same-seed runs were re-run with the digest checkpointed
+every 10000 steps and full state dumped at the end.
+
+** The whole divergence is one field
+
+: 22c22
+: <   "timestamp": "1787694198.869361"
+: ---
+: >   "timestamp": "1787694387.998919"
+
+*Two lines of diff across the entire state.* The values differ by ~189 seconds —
+exactly the wall-clock gap between two sequential runs. The source is
+=tuxemon/battle.py:33=:
+
+: self.timestamp: float = time.time()
+
+Every completed battle is persisted into =npc_state.battles= carrying a
+wall-clock reading. At 20000 steps no battle had *finished*, so =battles= was
+empty and the hash matched; at 120000 steps battles complete and the leak
+appears.
+
+The checkpoint series shows the digest is *constant from step 10000 through
+110000* inside each run, and already divergent at the first checkpoint. This was
+never a slow drift — it is one field stamped once, early.
+
+** Verdict
+
+*The simulation is deterministic at 120000 steps across ~88700 RNG calls.* Three
+same-seed runs agreed on every gameplay outcome and on the RNG call count, and
+differed only in a persisted clock reading. This is the third wall-clock leak
+found (after =day_of_year= / =hour=), and it is the second time an unpinned
+clock silently corrupted a comparison — which is the argument for treating a
+missing clock pin as a *refusal* rather than a warning.
+
+* Finding 3: wall-clock leaks into game state (real, NOT fixed here)
+
+=time_handler.py= writes real date and time into game variables. Observed in a
+live run:
+
+: day_of_year: 237   hour: 13   daytime: true
+
+27 call sites of =datetime.now()= / =time.time()= / =date.today()=. Two runs on
+different days — or either side of 18:00 — will diverge, and day/night gates map
+events. A trace recorded today is not replayable tomorrow without an injectable
+clock. *This probe pinned the clock by accident, not by design*: all runs
+happened within one hour on one day.
+
+* Finding 4: the shipped recorder cannot be the trace format
+
+Upstream already has =InputRecorder= (wired into =BaseClient=, exposed as event
+actions =input_record= / =input_playback= / =input_save= / =input_load=). It is
+the right *shape* and the wrong *semantics*:
+
+- =PlayerInput.timestamp= defaults to =time.time()= — wall-clock, not a step index.
+- =InputManager.process_events()= in playback mode yields *one event per frame*
+  regardless of when it was recorded. A 3-second walk and a 3-minute walk replay
+  identically. Timing is destroyed on load.
+- =initial_state= is only ={map, player_x, player_y, direction}= — no party, no
+  inventory, no game variables. Replay does not start from a defined world.
+
+This probe therefore *replaced* =process_events= with a step-indexed schedule
+rather than reusing the upstream playback path.
+
+* What was NOT measured
+
+Stated plainly, because the headline number is narrower than it looks.
+
+- ~=Combat was never entered=~ — *closed*, see
+  [[*Gate 2 — determinism through an actual battle]]. Combat is deterministic.
+- ~=No battle was ever fought to completion=~ — *partly closed*. Level-up,
+  experience, battle winnings and a party faint are all now exercised and
+  reproduce exactly (see [[*Gate 3 — depth: 120000 steps, and the last leak]]).
+  Still unmeasured: capture, evolution, and a clean exit from =CombatState=
+  back to the world — no run left combat.
+- *The digest covers a partial surface*: player NPC state (30 fields, including
+  monsters, items, money, game_variables), =world_state= (only
+  =factions_manager= and =menu_flags=), map, tile_pos, facing, state stack. It
+  does *not* cover weather state, non-player NPC state, or combat internals.
+- *Long horizons partly tested.* Longest run is now 120000 steps (~33 min of
+  game time). A multi-hour speedrun is still unproven, and note that the
+  measured surface stopped changing after step 10000, so those later steps
+  tested far less than their count suggests.
+- *One machine, one OS, one Python* (3.12.13, macOS arm64). Cross-platform
+  reproducibility is unknown.
+
+* Recommendation
+
+Proceed with S1 (deterministic trace core) and *assume verify-by-equality is
+available* — the evidence supports it. Concretely:
+
+1. Pass a seed to =WorldWeatherManager= and route =uuid4()= through a seeded
+   factory. Both are small and upstream-shaped.
+2. Add an injectable clock before anything else records a trace. This is now
+   the single highest-value fix: it closes =day_of_year= / =hour=,
+   =Battle.timestamp=, and the session playtime fields in one move, and it is
+   the *only* thing standing between the current state and byte-identical
+   replay.
+3. Make the trace step-indexed and give it a real initial state (the save system
+   already serializes one — reuse =SaveData= rather than inventing a format).
+4. ~=Re-run this probe through a real battle=~ — *done*. Combat is
+   deterministic; verify-by-equality survives contact with the stochastic part
+   of the game. The format does not need a divergence-tolerant comparison mode
+   on combat's account.
+5. Route event-action updates through the step clock rather than
+   =time.perf_counter()=, and give the executor a save-based start rather than a
+   state-stack unwind.
+
+* Reproducing
+
+Throwaway code lives in =spike/= and is not production. From =tuxemon/=:
+
+#+begin_src bash
+PYTHONHASHSEED=0 ../.venv/bin/python ../spike/probe_battle.py \
+    --seed 1234 --label F1 --seed-weather --seed-uuid
+#+end_src
+
+=probe_determinism.py= is the base harness (headless bootstrap, step-indexed
+input schedule, state digest); =probe_rng.py= counts and dumps RNG calls;
+=probe_battle.py= adds the weather/uuid seeding and party generation;
+=probe_combat.py= drives a real =CombatState=:
+
+#+begin_src bash
+PYTHONHASHSEED=0 ../.venv/bin/python ../spike/probe_combat.py \
+    --seed 1234 --label K1 --battle-steps 20000 --trace
+#+end_src

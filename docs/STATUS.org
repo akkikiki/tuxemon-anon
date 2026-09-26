@@ -1,0 +1,3282 @@
+#+TITLE: Project status — deterministic trace format and offline replay
+#+DATE: 2026-08-27 (last revised at S3 close-out; S1 sections keep their original measurement dates)
+
+Read this file first, before any spec, plan, or task report under
+=.superpowers/sdd/=. It states what is true of the tree right now; those
+other documents state what was *intended*, or what was true at the moment
+they were written. When they disagree, the authority order is: this file's
+own measured claims (re-run them if in doubt) > =docs/*.org= measurement
+notes > the spec > the plan. See =CLAUDE.md= for how that order applies
+day to day.
+
+* Deliverable, achieved
+
+A portable, step-indexed trace format plus an offline executor for
+Tuxemon. Given a seed, Tuxemon now replays byte-identically — verified
+through a *completed* battle (capture, level-ups, experience, winnings,
+and a clean exit of =CombatState= back to the world), at both a daytime
+and a night-hour =clock_epoch=.
+
+* The patch series — the sole durable record
+
+The applied =tuxemon/= tree is git-ignored (see =.gitignore=); nothing
+under it is committed directly. The six files under =patches/= are the
+only durable record of every engine change this project made, and
+=make patch=/=make unpatch= are how you move between "pristine vendored
+clone" and "the tree every test in this repo assumes". Applying all six
+from pristine, in numeric order, produces: 18 files changed, 265
+insertions(+), 63 deletions(-), plus 2 untracked files
+(=tuxemon/core/clock.py=, =tuxemon/core/ids.py=). Verified for real as
+part of this task — see "Patch round-trip, verified" below.
+
+| Patch | What it closes |
+|-------+-----------------|
+| =0001-headless-init-graphics= | =pg.init()= + =set_mode()=, so headless can load sprites at all; =NullRenderer= gains =layer=/=layer_color=/=layer_image=/=bubble_manager=/=map_animations=/cinema ratios — without these a night-hour epoch crashed with =AttributeError= at =set_layer.py:54=. |
+| =0002-seed-weather-rng= | =WorldWeatherManager(seed=…)=, the only =random.Random= INSTANCE in the codebase; plus =config.deterministic_seed= and its propagation through =copy()=. |
+| =0003-seeded-uuid-factory= | =tuxemon/core/ids.py=; six call sites (entity, monster, technique, status, battle, item). =uuid4()= ignores =random.seed()= entirely, so nothing short of replacing the call sites closes this. |
+| =0004-injectable-clock= | =tuxemon/core/clock.py=; =clock_epoch= is interpreted in *UTC*, not host-local time — the two disagree on both hour and day-of-year for the same epoch, which corrupted a comparison twice during the spike before this was pinned. |
+| =0005-action-step-clock= | =EventAction.run()='s wall-clock spin loop replaced by an =EventEngine= deferral queue advanced from =update(dt)=. Removed the need for =skip=True= on combat calls; closed an observed deadlock. |
+| =0006-headless-entry-from-save= | =headless_world()= entry plus =start_networking=False=. |
+
+* Patch round-trip, verified
+
+Ran, in this task, on this tree:
+
+#+begin_src bash
+make unpatch && make patch && make check
+#+end_src
+
+- =make unpatch= (=git checkout -- . && git clean -fd= inside =tuxemon/=)
+  removed both untracked patch files and reverted every tracked edit;
+  =git -C tuxemon diff --stat= was empty afterward.
+- =make patch= (=git apply= over =patches/*.patch=, numeric order) applied
+  all six cleanly, no failures.
+- The resulting tree was diffed byte-for-byte (=diff -rq --exclude=.git=)
+  against a snapshot of the tree taken immediately before =unpatch= ran:
+  *zero differences*. =git -C tuxemon diff --stat= reported the same 18
+  files / 265 insertions(+) / 63 deletions(-), same 2 untracked files, as
+  before the round-trip.
+- =make check= on the freshly-restored tree: green (see below), same
+  counts as the pre-round-trip run.
+
+=unpatch= is destructive — the applied tree is git-ignored and not
+otherwise recoverable — so this round-trip is the thing that makes
+trusting =make patch= as the restoration path reasonable, rather than an
+assumption.
+
+* Exemption register
+
+=tuxghost/digest.py='s =EXEMPTIONS= is =={}=, the spec's stated target.
+Its size is the honest measure of remaining known nondeterminism in
+whatever =state_of()= actually digests — not a claim that every source of
+nondeterminism in the vendored engine is gone, only that none of them are
+currently being silently masked by an exemption entry. Two raw =uuid4()=
+call sites remain outside the digested tree entirely (see "Known limits"
+below) precisely because an exemption for them would be untestable dead
+weight, not because they were missed.
+
+* Test state
+
+=make check= green: 128 passed / 3 skipped (fast), plus 3 passed behind
+the =slow= marker (opt-in via =TUXGHOST_RUN_SLOW=1=). The 3 skipped are
+the slow-marked tests themselves, correctly deselected without that
+env var. (Count updated in the final fix wave: nine new tests pin the
+three must-fix defects below plus the =--checkpoint= flag; the slow
+count is unchanged.)
+
+This section is S1's own count, left as it was measured at the time.
+*S2 raised the fast tier to 203 passed / 3 skipped* (75 net new tests),
+slow tier unchanged at 3 passed / 203 deselected, and later to 213
+passed / 3 skipped after the live-model capture — see "S2 — CU-agent
+harness, delivered" below.
+
+*Current, as of S3's final fix wave: 356 passed / 4 skipped / 11
+warnings (fast) and 4 passed / 356 deselected / 1 warning (slow), =make
+check= =EXIT=0=*, measured sequentially on this tree. (S3's close-out
+commit measured 347 / 4 / 11; the fix wave added nine tests.) That is the
+number to trust; see "S3 — offline trajectory optimizer, delivered" below
+for the full gate output and for why three runtime figures (=10:52=,
+=41:54= and the fix wave's own =332.14 s=) must not be inherited as
+timings.
+
+* Measured determinism results, with real digests
+
+- *Golden trace* (=tests/golden/walk_1234.tuxghost=, seed 1234, 900
+  steps, daytime =clock_epoch=): =header.final_digest= =
+  =badf7f1010af0c93c7bb21882d7ca04da1f909a1dcda2d347ac7b6c91fea5aec=.
+  =execute()= against this trace reproduces that exact digest today; the
+  only field that legitimately drifts is the metadata
+  =patch_series_id= (it hashes the current =patches/= directory, which
+  keeps changing as patches are added — =verify()=/=execute()= warn on
+  this, by design, rather than fail; see =tuxghost/trace.py='s refuse/warn
+  matrix).
+- *Completed battle, daytime* (=tests/test_combat_determinism.py=, seed
+  1234, =BATTLE_EPOCH = 1787659200= = 2026-08-25T12:00:00 UTC):
+  =CombatState= reaches step 4945 and exits back to the world,
+  reproducibly. With patches 0003/0004/0005 applied, the full state
+  digest — not just exit/no-exit — matches byte-for-byte between two
+  independent same-seed runs. Before those three patches, the same
+  scenario diverged in exactly four fields, all unseeded =uuid4()= or a
+  wall-clock =Battle.timestamp= (see
+  =docs/2026-08-25-battle-exit-measurement.org= for the field-level
+  diagnosis); none of that divergence remains.
+- *Night-hour epoch* (=tests/test_digest.py='s
+  =NIGHT_EPOCH = 1787774400= = 2026-08-26T20:00:00 UTC,
+  =stage_of_day == "night"=): digest-stable across repeated runs, once
+  patch 0001's =NullRenderer= fixes existed — before them, this route
+  crashed outright (=AttributeError= at =set_layer.py:54=), it did not
+  merely diverge.
+
+* What is still unmeasured
+
+- *The spec's =world_state= widening commitment did not ship.* The
+  spec's Known Limitations section states plainly: "~world_state~
+  coverage is thin — serialization yields only ~factions_manager~ and
+  ~menu_flags~. Widening it is in scope for S1." That widening did not
+  happen — =tuxemon/save_system/save_state.py='s =WorldSave= still has
+  exactly those two fields, confirmed by reading the class directly. What
+  DID get widened this project (task 12) is a different subtree,
+  =persistent_npc_state=, not =world_state= — see the next bullet for why
+  that widening measures nothing on any trace this project can currently
+  record. So, honestly: the =world_state= half of =state_of()='s digested
+  surface is exactly as thin today as it was at the end of the spike: two
+  fields, no wider. Anyone relying on =verify() == 0= to certify
+  =world_state= coverage beyond faction standings and menu-unlock flags
+  is relying on something this project never built.
+- *Capture and evolution as their own scenarios.* The completed-battle
+  measurement above exercises level-ups and winnings as a side effect of
+  one battle route; nothing separately isolates capture or evolution as
+  their own digest-stability scenario.
+- *A trace that captures a RESOLVED battle mid-recording.*
+  =boot_from_save= cannot restore mid-combat state (there is no
+  serializer seam on =CombatState=), and a resolving battle needs
+  ~4945+ steps from a cold boot — no golden trace covers this; it needs
+  its own slow-tier golden.
+- *Cross-platform reproducibility.* Untested. One machine (macOS
+  26.6.1 arm64), one OS, one Python (3.12).
+- *Combat internals.* =state_of()= covers the player's =NPCState=,
+  =world_state=, =persistent_npc_state=, map, tile, facing, and the
+  state-stack NAMES. It does NOT cover combat internals (turn count,
+  opponent HP) — there is no serializer seam on =CombatState=. So
+  =verify() == 0= certifies that the player-visible outcome reproduced,
+  not that combat itself played out identically turn-by-turn.
+- =persistent_npc_state= is plumbed and discriminates correctly (a
+  dedicated test hand-flips a spawned NPC's =persistence= flag to prove
+  it), but is =[]= on every currently-recordable trace: no NPC in
+  =mods/tuxemon/db/npc/*.yaml= sets =persistence: true=. It adds no
+  practical coverage today.
+- =tuxemon/mission/mission.py:47= and =tuxemon/event/eventparser.py:52=
+  still hold raw =uuid4()=, unreachable by any route this suite currently
+  drives.
+- Cancelled-between-frames deferred actions (patch 0005) never get
+  =cleanup()= called on them. This matches upstream's existing behavior
+  for the analogous case, and =EventAction.cancel()= has zero callers
+  anywhere in the vendored tree, so it is latent, not live.
+- *The shipped gate never reproduces the spec's own cross-=PYTHONHASHSEED=
+  evidence.* The determinism spike (=docs/2026-08-25-determinism-spike.org=)
+  demonstrated byte-identical digests "across two ~PYTHONHASHSEED~ values",
+  which mattered because Python randomizes string/dict hashing per process
+  by default — a digest that happened to depend on that would fail
+  intermittently, not deterministically. But both Makefile test targets
+  (=make test=, =make slow=) run =PYTHONHASHSEED=0=, unconditionally, so
+  every =make check= run this project's gate performs pins the SAME hash
+  seed every time; the spike's second-seed evidence is not re-exercised by
+  anything CI or a contributor runs today. This is mitigated, not
+  unfounded: =tuxghost/digest.py='s =_canonical= sorts every dict's keys
+  before hashing and =json.dumps(..., sort_keys=True)= is used throughout
+  =tuxghost=, so nothing in the digest pipeline should be reading raw
+  dict/set iteration order in the first place — but that claim currently
+  rests on code inspection, not on the suite actually varying the seed and
+  observing the same digest twice. No second-hashseed run has been added
+  to the Makefile as part of this fix wave; documenting the gap here is
+  the honest alternative to quietly re-asserting evidence the shipped gate
+  does not produce.
+- *The test suite depends on mutable state OUTSIDE this repo*:
+  =~/.tuxemon/cache/l18n/*.mo= (corrupted once by two concurrent test
+  runs racing on the same file — do not run two full suites at once; see
+  =CLAUDE.md=), and =~/.tuxemon/tuxemon.yaml='s =display.fps= (now guarded
+  by an assertion at boot — a mismatched or non-positive =fps= raises a
+  clear =ValueError= instead of silently producing a wrong first-frame
+  =dt= or a bare =ZeroDivisionError= — but it is still an external input
+  nothing in this repo controls).
+
+* S2 — CU-agent harness, delivered
+
+An agent sees a rendered game frame, answers with a
+=(button, hold, settle)= action, and the run is recorded through the
+*same* =tuxghost.record.Recorder= S1 already ships, as a
+=provenance.recorder = "cu-agent"= trace that the S1 executor verifies
+unchanged. Spec: =docs/superpowers/specs/2026-08-26-cu-agent-harness-design.org=
+(=#+STATUS: implemented=).
+
+Task history: S2's =.superpowers/sdd/= workspace was deleted at its own
+close-out, as every plan workspace in this project is. The durable record
+is the git history — S2 spans =c3d1f15= (spec) through =61f63aa= (final
+residuals), plus =95912aa= (the live-model capture) — and this section.
+Do not look for a task-report directory; there isn't one, and a pointer
+to one is a dead pointer by design.
+
+** No seventh patch
+
+The patch series stays at six. Every seam S2 needed — a real
+~MapRenderer~ installed via ~BaseClient.set_renderer~, drawn through
+upstream's ~StateDrawer~ — was already public. The discriminating
+measurement: the stock headless ~NullRenderer~'s frame of a loaded map
+sampled to *1* distinct colour (pure black); the same
+~WorldState.draw(surface)~ call with a real ~MapRenderer~ installed
+sampled to *48* distinct colours (floor, bed, furniture, player sprite).
+That gap is the entire justification for installing a renderer at all,
+and it is pinned by a regression test (Task 2), not just asserted once.
+=git -C tuxemon status --short= / =git -C tuxemon diff --stat= confirm
+the tree is still exactly the same 18 files changed / 265 insertions(+)
+/ 63 deletions(-), plus the same 2 untracked files
+(=tuxemon/core/clock.py=, =tuxemon/core/ids.py=), as S1 left it —
+re-measured as part of this close-out task, not carried forward from
+memory. =tuxghost/digest.py='s =EXEMPTIONS= remains =={}=. =patches/=
+still holds exactly six files.
+
+** The fixture
+
+The committed start-fixture (=tests/fixtures/paper_town.save=, built by
+=tests/fixtures/make_paper_town_save.py=) spawns =npc_red= on
+=spyder_paper_town.tmx= at tile =(12, 12)= with a two-monster party
+(=rockitten=, =budaye=). Spawn =(12, 12)= is leavable in =DOWN=, =UP=
+and =RIGHT= only — =LEFT= is blocked by collision. One tile of walking
+measures as *16 steps* (raw per-tile deltas =[2, 16, 16, 16, 16]=; the
+leading =2= is a start-position edge effect), corroborated by
+=STEP_RATE 60 / player_walkrate 3.75 = 16=.
+
+One thing that spawn is NOT: unoccluded. At tile (12, 12) the player
+stands behind the map's house, drawn on a layer above the sprite, so the
+first frame of every agent run from this save shows no player avatar at
+all — measured, and noticed unprompted by the live model itself (see "The
+live-model capture" below, finding 2).
+
+** Two S1 defects found and fixed by S2's work, neither reachable by S1's own 131-test suite
+
+- An unresolvable =npc_state.current_map= escaped as an uncaught
+  =OSError=, so =verify()= raised instead of returning its documented
+  exit 2, and the CLI would have reported exit 1 ("diverged") for what
+  was actually a refusal. Fixed: =resolve_map_asset= now mirrors the
+  engine loader's own leniency (=map/loader.py= stems the name and
+  re-appends =.tmx=) and requires an existing =.tmx= FILE, so =""=,
+  ="."= and ="../db"= are refusals rather than directory hits.
+- A player restored by =boot_from_save= was never registered on
+  =client.npc_manager= and never movement-unlocked, so it *could not
+  move at all*. Upstream's own =load_game.py= re-teleports after
+  =load_state= precisely to trigger those side effects; =boot_from_save=
+  restores directly, so nothing did. The two calls must stay AFTER
+  =push_state=, because =change_map= runs =_clear_npcs()= synchronously
+  and would wipe an earlier registration.
+
+*Why S1's suite could not have caught the second one*: the committed
+golden trace's 80 inputs are ALL button 64 (=A=). Despite its name,
+=walk_1234.tuxghost= never presses a direction, so no existing test
+could detect a movement regression. This bounds what "the suite is
+green" actually meant for anything movement-related, before S2.
+
+** The digest's measured blind spot
+
+On the =paper_town= fixture, 600 idle ticks leave =state_of()=
+BYTE-IDENTICAL. =state_of= covers map, tile_pos, facing, state_stack
+(NAMES only), npc_state, world_state and persistent_npc_state; none
+advances on an idle =client.update(dt)=. What an idle tick *does*
+change, all invisible to the digest: the harness's own scheduled-input
+step cursor; the map renderer's per-step animation clocks
+(=camera_manager.update= / =map_animations.update_all=); live state
+internals beyond names; and event-engine timers in flight.
+*Operational consequence*: any future "observation must not perturb
+state" test needs a PENDING SCHEDULED INPUT, not an idle schedule, or it
+proves nothing — this project already had one test built on the idle
+version before that was caught.
+
+** Settled end states cannot detect a perturbation in this game
+
+Grid movement makes a tile an attractor, so a change to WHEN something
+happens but not WHERE it ends is invisible to a final-digest comparison.
+Measured: against an injected =client.update(1.0/60)= in the render
+pass, per-step digest sequences diverged at step 1 and stayed diverged
+through index 56 of 59 before re-converging — 56 differing steps that a
+final-digest assertion alone would have read as identical. Three of this
+plan's own gates had to be rewritten to compare SEQUENCES rather than
+endpoints because of this.
+
+** The agent's FRAMES are wall-clock dependent, and =clock_epoch= does not fix it
+
+=pyscroll/data.py:132= (a third-party dependency, reached through
+~MapRenderer~) drives tile animation from =time.time() * 1000=;
+=pin_clock= pins the engine's own clock module (patch 0004), not =time=
+inside a third-party package. Two back-to-back ~png()~ calls of the same
+state differed about one run in three because of it. This does NOT
+break trace replay — nothing pyscroll touches enters =state_of()=, and
+inputs are ground truth once recorded — but it does mean the same agent
+at the same seed and epoch can be shown two different images of the same
+state, so a live model run is unreproducible for a reason that would
+persist at temperature zero. Not fixed here, by choice: pinning
+=time.time= process-wide would mean either vendoring pyscroll into the
+patch series (=patches/= is not for that) or a global monkeypatch every
+consumer inherits, for a guarantee (frame reproducibility) this project
+never promised. See the spec's Known Limitations for the full reasoning.
+
+** The live-model capture — model =claude-sonnet-5=, 2026-08-27
+
+The Anthropic wire contract now has exactly ONE live capture behind it,
+and everything below is measured from it rather than assumed. Before this,
+every =ClaudePolicy= test used an injected stub and no committed
+transcript had ever been near the API.
+
+The invocation (from the repo root, real API, key supplied out of band):
+
+#+begin_src bash
+tuxghost agent --policy claude \
+  --from-save tests/fixtures/paper_town.save \
+  --seed 1234 --clock-epoch 1787659200 --steps 600 --upscale 1 \
+  --goal "Explore this town on foot and find another person to talk to. Keep moving and keep trying; do not end the run early." \
+  --out tests/golden/claude_town_1234.tuxghost --run-dir <run dir>
+#+end_src
+
+Exit *0*. 5 decisions, 442 of 600 steps, =stop_reason= "step budget",
+=final_digest= =bc717075d0ba16b8731ae89ddf92f8aa9ff3201429f6766c480f02cded5faf1f=.
+=--model= was omitted, so this exercises the shipped default path:
+=tuxghost.agent.claude.DEFAULT_MODEL= = *=claude-sonnet-5=*. No other
+model id has live evidence, and =anthropic= resolved to *1.1.0* (the
+=[agent]= extra's floor is 0.40; the SDK's 0.x→1.x major bump did not
+affect either binding this project uses, =anthropic.Anthropic()= and
+=messages.create=).
+
+*What the run actually did*, from its own transcript: walked RIGHT/DOWN
+out of the spawn area, spotted an NPC two tiles away, walked LEFT to her,
+pressed =A=, pushed a =DialogState=, and advanced the dialogue with six
+more =A= presses before heading for the shop. It reached the goal — a
+judgement made BY HAND from the transcript and the frames, not by any
+evaluator: =--goal= still has none (see "Honest limits"), and nothing
+in the suite scores this run's outcome.
+
+That matters beyond novelty. Every one of the older golden's 80 inputs
+(=tests/golden/walk_1234.tuxghost=) is button 64 (=A=) — despite its name
+it never walks — so until this capture NO committed trace exercised
+replaying a directional press or a pushed state at all, which is exactly
+the gap two S1 defects hid in (see "Two S1 defects found and fixed by
+S2's work" above).
+
+*What is therefore no longer unmeasured*: request-shape acceptance
+(base64 =image/png= content blocks plus a =system= string and a sliding
+4-turn window), the real response object's =.content= /
+=.type= / =.text= shape (the =getattr(block, "type", None) == "text"=
+filter in =ClaudePolicy.decide= works against the real SDK's objects),
+=MAX_TOKENS = 1024= sufficiency (no truncated answer in 7 live answers
+across this run and a 2-decision smoke run before it), and JSON-fencing
+reliability (7 of 7 answers parsed; zero =ValueError= from
+=parse_response=).
+
+*Still unmeasured*: prompt BUILDING has no real-model coverage of any
+kind — nothing checks that =build_messages= produces what the API
+prefers, only that the API accepts it. Nothing in =make check= re-runs
+the model, by design: the gate must not need a network or a key. And a
+live run is not reproducible from seed alone — see "Honest limits" above.
+
+*** Three findings the capture produced
+
+1. *The stub suite could not have caught a fence regex that cannot span
+   newlines.* Every stub answer in =tests/test_agent_claude.py= has a
+   SINGLE-LINE json payload; every real answer is multi-line (the model
+   pretty-prints across =actions=/=notes=/=claimed_outcome=). Measured:
+   deleting =re.DOTALL= from =ClaudePolicy._JSON_BLOCK= leaves all 16
+   stub tests passing and fails only the new
+   =tests/test_live_capture.py::test_transcript_raw_answers_reparse_to_their_recorded_actions=.
+   That test exists because of this, and the two module docstrings that
+   claimed committed transcripts were all synthetic are corrected.
+2. *At the fixture's spawn tile the player sprite is not visible.* The
+   model said so unprompted in its first note ("No player character
+   visible in initial frame"), and frame =00000.png= confirms it: tile
+   (12, 12) puts the player behind =spyder_paper_town.tmx='s house, which
+   the map draws on a layer above the sprite, so the agent's very first
+   observation does not contain its own avatar. Four tiles later the
+   player renders plainly (blue cap, centre of frame). This is an
+   occlusion property of the FIXTURE plus the camera, not a renderer
+   defect — a scripted control run walking DOWN/RIGHT shows the sprite in
+   frames 1-7 — but it does mean the first decision of every run from
+   this save is taken semi-blind. A future fixture should spawn somewhere
+   unoccluded.
+3. *A run that ends because the policy said STOP discards the answer that
+   said so.* =run_agent='s STOP break path never reaches
+   =decisions.append=, and =run.json= records only
+   =stop_reason: "policy returned STOP"= — the model's final raw answer
+   lives in =policy.last_raw= and is dropped on the floor. Observed for
+   real in the smoke run (2 decisions, second answer lost); the committed
+   capture stopped on step budget instead, so its transcript is complete.
+   Not fixed here: it is a real observability gap, recorded rather than
+   quietly left for someone to rediscover.
+
+*** Practical note on =--upscale=
+
+The capture passed =--upscale 1=. The CLI's default is 4, which — layered
+on =scaled_context()='s measured scale 5 — sends 5120x2880 PNGs that the
+API downscales anyway. At scale 5 the drawn region already fills
+1280x720 (see =tuxghost/observe.py='s =png= docstring), so upscaling
+before sending buys nothing but bytes.
+
+*** The committed artifacts, and what pins them
+
+- =tests/golden/claude_town_1234.tuxghost= (10 KB) — the recorded trace,
+  =provenance.recorder = "cu-agent"=, =model = "claude-sonnet-5"=.
+- =tests/fixtures/claude_town_1234.decisions.jsonl= (4.6 KB) — the real
+  transcript, =raw= answers included.
+- =tests/fixtures/claude_town_1234.run.json= — goal, seed, epoch, model,
+  stop reason, so the transcript is not an orphan.
+- Frames are NOT committed: 5 PNGs at ~19 KB each is exactly the bloat
+  that cost S1 a 3.7 MB blob (see task 14's history).
+
+=tests/test_live_capture.py= holds five tests over them, each
+demonstrated to fail against the defect it pins:
+
+| Test | Mutation it was shown to fail against | Discrimination |
+|------+--------------------------------------+----------------|
+| =..._trace_verifies=, =..._still_reaches_its_recorded_digest= | =tuxghost/execute.py='s =_schedule_of= drops every non-=A= button | both fail (=verify= 1≠0; digest =e60cad02…= vs =bc717075…=) while ALL FOUR =walk_1234= golden tests keep passing — the point of the fixture in one measurement |
+| =..._presses_directions_not_only_a= | point it at =walk_1234.tuxghost= | fails with =assert ({64} - {64})= — which also re-measures that the old golden is A-only |
+| =..._raw_answers_reparse_to_their_recorded_actions= | drop =re.DOTALL= from =_JSON_BLOCK= | fails alone; 16 stub tests pass (finding 1 above) |
+| =..._transcript_replays_to_the_captured_trace= | =ReplayPolicy.decide= loops instead of returning =STOP= when exhausted | fails =assert 546 == 442= |
+
+The replay test is also an independent re-confirmation of the
+digest-neutrality of display scale: the live run recorded at
+=scaled=True= (scale 5) and the test replays at =scaled=False=, and the
+input schedule and =final_digest= match byte-for-byte.
+
+=tests/conftest.py='s =patch_series_id= tripwire tracks the new file with
+NO pinned entries, deliberately: this fixture was recorded against the
+current =patches/=, so it must warn zero times, and the day a seventh
+patch lands the tripwire fails loudly instead of the stale fixture
+joining the ambient noise.
+
+** Display scale: measured digest-neutral, real scale is 5
+
+=headless_init= hardcodes =scale=1=; the real game computes
+=int(1280 / 256)= (256 = =NATIVE_RESOLUTION[0]=) = *scale 5*, not the 4
+an earlier draft of the spec and plan asserted unmeasured. At scale 5,
+=tile_size (16,16) -> (80,80)=, and the visible camera shrinks from
+roughly 80x45 tiles to roughly 16x9 — a human-comparable field of view.
+
+Measured *digest-neutral*: per-step digest sequences over a 300-step
+moving route (=DOWN=/=UP=/=RIGHT=, not idle — see the digest blind spot
+above) are byte-identical at every index between an unscaled (=scale=1=)
+and a scaled boot, re-confirmed independently in two separate processes
+with matching sequence hashes. Because of this, agent runs can opt into
+the scaled, human-FOV context (=run_agent(scaled=True)=, which the CLI
+passes; the library default stays =False=) without affecting anything
+=tuxghost.execute= does — the trace header carries no scale field and
+gains none, so digest-neutrality is exactly what makes the
+record-scaled/replay-unscaled asymmetry safe. If a future patch ever
+makes rendering geometry digest-reachable, this must be re-measured, not
+assumed.
+
+=scaled_context()= *refuses loudly* if it is not the first context built
+in the process, because =tuxemon/graphics.py= and =tuxemon/map/view.py=
+bind =DISPLAY_CONTEXT= by name at import time. Before that guard
+existed, a later call in a contaminated process silently produced a
+frame *worse* than the unscaled default: decoded =(1216, 656)=, 16px
+tiles on an 80px pitch, mostly black, player sprite absent. The guard
+turns that failure mode from a silent degraded frame into a loud
+refusal.
+
+*The renderer install surviving a map change is now measured, not
+inferred.* An earlier spec draft called this "expected to survive —
+unmeasured" (reasoning from ~reset_renderer()~ being a no-op on
+~BaseClient~ and ~MapRenderer~ holding managers rather than a map).
+Task 2's =test_installed_renderer_survives_a_map_change= passed on its
+first real run against a real teleport: the installed renderer does
+survive a map change, and =reset_renderer()= does not clobber it. The
+spec has been corrected to say so (Step 4 of this close-out).
+
+** The CLI's exit codes: 0 or 2 for every anticipated precondition, 1 only for a genuine engine bug
+
+=tuxghost agent= never returns exit 1 for anything it can anticipate —
+there is nothing for a recording to diverge *from*, so no precondition
+failure may report that code. A genuine internal engine invariant
+failure is deliberately the one exception: it still exits 1, a visible
+crash, rather than being laundered into a tidy "refused". (An earlier
+version of this heading claimed "0 or 2 only, never 1" outright, which
+its own next paragraph — "a genuine engine invariant failure stays a
+visible crash" — already contradicted; reworded so the headline matches
+the documented exception instead of being corrected by it two sentences
+later.) Four separate exit-1 paths were found and closed
+during Task 8: a dead =except ImportError= around =ClaudePolicy=
+construction (the import is lazy, so a missing =anthropic= would have
+escaped from deep inside =run_agent=); a =--policy replay= transcript
+whose record is malformed *mid-run* (=ReplayPolicy= parses lazily inside
+=decide()=, unlike =ScriptedPolicy= whose actions the CLI pre-parses); a
+non-object line in a =--policy scripted= actions file; and an invalid
+=--upscale=. The =run_agent= call is bounded by
+=except (ValueError, TypeError)= for exactly those four cases —
+deliberately not =Exception=, so a genuine engine invariant failure stays
+a visible crash instead of being laundered into a tidy "refused".
+
+A *fifth* exit-1 path was found by the whole-branch review (Important
+#2) and closed the same way: =ClaudePolicy.decide= calls the =anthropic=
+SDK's =messages.create= from inside =run_agent='s loop, and every error
+that call can raise (=RateLimitError=, =APIConnectionError=,
+=AuthenticationError=, a missing/invalid API key, ...) derives from
+=anthropic.AnthropicError(Exception)=, not =ValueError=/=TypeError= — the
+boundary above never caught any of them, so =--policy claude= alone
+among the three policies could still exit 1. A second =except Exception=
+arm around the same =run_agent(...)= call re-raises anything that is not
+actually an =AnthropicError= (a genuine engine bug still crashes) and
+maps a real one to exit 2 with its own message. No committed test
+exercises =--policy claude= (it would require a live API call), so this
+was verified BY HAND: a fake =anthropic= module injected into
+=sys.modules= plus a stubbed =run_agent= that raises the fake
+=AnthropicError= — =_agent= returned 2 with the expected message; the
+same stub raising a plain =RuntimeError= instead propagated uncaught, as
+a real bug should.
+
+*Final residuals fix (item 1)*: that arm originally imported =anthropic=
+UNCONDITIONALLY inside itself, on the claim that the import "cannot fail
+... in practice" — true only on the =--policy claude= branch, but the
+arm itself is reachable from all three policies, and =make check='s
+environment deliberately never installs =anthropic= at all. The real
+consequence: any genuine, non-=ValueError=/=TypeError= crash out of
+=run_agent= on =--policy scripted=/=replay= (e.g. a real
+=AttributeError= engine-invariant failure — the same class this branch
+hit for real during Task 8) had its bare =raise= immediately superseded
+by =ModuleNotFoundError: No module named 'anthropic'= raised while
+handling it — reproduced BY HAND with a stubbed =run_agent= raising
+=AttributeError= under =--policy scripted=, exit code still 1 and the
+original exception chained as the cause, but the headline exception
+wrong on exactly the path whose whole design intent is "a genuine engine
+invariant failure must stay a visible crash". Fixed by gating the whole
+arm on =args.policy == "claude"= instead of import-guarding it: the
+=isinstance(exc, anthropic.AnthropicError)= check, and the =import
+anthropic= it needs, is now only ever reached on the one policy that can
+actually raise one, so =--policy scripted=/=replay= never touch
+=anthropic= and the real exception re-raises unmodified. The refusal
+message and the false "cannot fail to import ... in practice" comment
+were corrected in the same pass. Re-verified BY HAND after the fix: the
+stubbed =AttributeError= under =--policy scripted= now propagates as
+itself, with no =ModuleNotFoundError= in the traceback.
+
+** The run directory, and one more refusal (final residuals, item 4)
+
+=tuxghost agent='s =--run-dir= holds three artifacts, not two: alongside
+=frames/NNNNN.png= and =decisions.jsonl= (one record per decision), the
+final whole-branch fix wave (M2+M3) added =run.json= — a single object
+with ~goal~, ~seed~, ~clock_epoch~, ~step_budget~, ~policy~, ~model~,
+~steps~, and ~stop_reason~. Nothing else in the run directory carries
+these: the goal is never IN any decision, seed/clock_epoch/policy/model
+are process arguments rather than part of any per-step record, and
+neither =break= path in ~run_agent~'s loop otherwise surfaces WHY a run
+ended. The spec and this doc previously inventoried only =frames/= and
+=decisions.jsonl=; both are now corrected to name =run.json= too.
+
+The same wave (M8) also added a fourth refusal to =agent='s exit-2 list:
+=--policy replay= given no =--model=. A replayed transcript carries no
+~model~ field of its own to read back (see =tuxghost/agent/replay.py='s
+record shape), so recording =ClaudePolicy='s unrelated default as
+=model= would misattribute provenance the trace format claims to be
+honest about; the CLI requires the caller to say which model the
+transcript actually is of instead of guessing.
+
+** New test counts
+
+Fast tier: *203 passed, 3 skipped* (was 128 passed / 3 skipped at the
+end of S1 — 75 net new tests). Slow tier: *3 passed, 203 deselected*
+(unchanged from S1). Both measured as part of this close-out task's
+=make check= run, on this tree, sequentially, per =CLAUDE.md='s standing
+rule against concurrent suites. All other gates (=ruff=, =lint-patched=,
+=mypy --strict= over 41 source files) green in the same run.
+
+*Updated by the final whole-branch fix wave*: fast tier is now *208
+passed, 3 skipped, 9 warnings* (=make check-fast=, measured on this
+tree; five new regression tests, each demonstrated to fail against the
+defect it pins and pass once fixed — that wave is commit =d03b587=; its
+task report lived in the deleted =.superpowers/sdd/= workspace, so the
+commit is the record).
+=ruff=, =lint-patched=, and =mypy= over the same 41 source files all
+green in the same run. The 9-warning count is unchanged from before the
+wave — parked minor 7's fix pins that count as a tripwire rather than
+reducing it (=tests/conftest.py=), so a future divergence in it fails
+the suite instead of hiding in "expected" noise.
+
+*Final residuals close-out*: a full, sequential =make check= (items 1-3
+above, plus item 4's doc-only changes) reconfirms *208 passed, 3
+skipped, 9 warnings* on the fast tier and *3 passed, 208 deselected, 1
+warning* on the slow tier — the baseline a contributor gets from a plain
+=make check-fast=/=make check=. This close-out's own gate run happened
+to export =TUXGHOST_RUN_SLOW=1= for the WHOLE invocation rather than
+scoping it to the =slow= target alone, which is a different, valid
+configuration, not a different result: with the three slow-marked tests
+no longer skipped in the fast =pytest= invocation, that run reports
+*211 passed, 10 warnings* (208 + 3, 9 + 1) instead of 208/3-skipped/9 —
+both numbers describe the same green tree. All gates (=ruff=,
+=lint-patched=, =mypy --strict= over 41 source files) green in the same
+run.
+
+This is also the first time the pinned tripwire's slow-tier entry
+(=tests/test_golden.py::test_long_horizon_trace_is_stable= — behind
+=TUXGHOST_RUN_SLOW=, never reached by =make check-fast=) has ever
+actually been evaluated: it ran, emitted exactly its pinned *1*
+=patch_series_id= warning, and the =pytest_sessionfinish= tripwire
+reported no mismatch. The pinned count for that entry is confirmed
+correct, not just assumed.
+
+*After the live-model capture* (2026-08-27): fast tier *213 passed, 3
+skipped, 9 warnings*; slow tier *3 passed, 213 deselected, 1 warning*.
+=make check= exit 0, sequentially, on this tree — five new tests
+(=tests/test_live_capture.py=), warning count deliberately unchanged
+(the new file's fixture was recorded against the current =patches/=, so
+it must warn zero times; the tripwire tracks it with no pinned entries
+to keep that true). =ruff=, =lint-patched=, =mypy --strict= over *42*
+source files green in the same run.
+
+That gate run happened with the optional =[agent]= extra
+(=anthropic= 1.1.0) installed locally, which the capture needed. The
+suite does not depend on it either way: =tests/test_live_capture.py=
+plus =tests/test_agent_claude.py= were re-run with =anthropic= blocked
+outright by a =sys.meta_path= finder that raises =ModuleNotFoundError=
+for it — 20 passed — so the SDK remains a genuine optional extra and
+=make check= still needs no network SDK. The new file constructs
+=ClaudePolicy()= with no client precisely so this stays true:
+=_ensure_client= (and its lazy =import anthropic=) is only reachable
+from =decide()=, which no test calls.
+
+** Honest limits
+
+- *Model sampling is not determinism.* A live =ClaudePolicy= run is not
+  reproducible from seed alone — the same seed and prompts can yield
+  different actions. What IS reproducible is the trace once recorded;
+  that is the guarantee this project actually makes. =ReplayPolicy=
+  exists so a model-driven run CAN be re-executed decision-for-decision
+  from a captured transcript.
+- *Rendered pixels are an unmeasured cross-platform surface.* Same
+  single-machine caveat as S1 (macOS 26.6.1 arm64, Python 3.12, one SDL
+  build), now sharper: font rasterisation and blit paths need not be
+  byte-identical across platforms, and nothing in S2 measures this.
+  Frames are an observation, never a digested input, so this cannot
+  corrupt a trace — but a policy's behaviour could differ on another
+  machine even where the trace format holds.
+- *=--goal= has no evaluator.* It is free text that goes into the prompt
+  and the run directory; nothing in S2 checks whether it was achieved.
+  The live capture's own goal WAS achieved (the model found and talked to
+  an NPC), but a person read the transcript to establish that; no code
+  did, and =tests/test_live_capture.py= asserts a =DialogState= was
+  reached, which is a proxy for "a conversation happened", not a score.
+  Scoring is S5's job, and a half-scorer here would be worse than none.
+
+* S3 — offline trajectory optimizer, delivered
+
+An editor proposes *named edits* to an existing trace's action list; each
+candidate is recompiled and replayed offline; an objective scores the
+state it reached; the winner is sealed as a
+=provenance.recorder = "offline-agent"= trace that =tuxghost verify=
+replays to the digest it recorded. Spec:
+=docs/superpowers/specs/2026-08-27-offline-optimizer-design.org=
+(=#+STATUS: implemented=). Tuning numbers:
+=docs/2026-08-27-optimizer-tuning.org=.
+
+=offline-agent= is the exact =recorder= value S2's spec reserved for
+"S3's offline optimizer, which is the thing that name describes"; no new
+=recorder= vocabulary was invented, =format_version= stays *1*, and no
+header field was added. Lineage lives in =provenance.taints= as one
+string, e.g. ~"derived by offline-agent (mutation, seed 3) from parent
+bc717075… over 32 round(s)"~. The round count is the number of rounds
+that *actually proposed edits* — not =len(rounds) - 1=, which counted
+round 0's absence and the deliberately-logged STOP round and so said
+"over 1 round(s)" for a run that applied none (measured; fixed in the
+final fix wave). The cost of that choice is accepted and
+stated rather than glossed: lineage is prose, so nothing can mechanically
+walk a chain of derived traces, and S4 would have to parse a string to
+render a lineage tree. If that becomes real it is a v2 header field,
+argued then.
+
+Task history: S3's =.superpowers/sdd/= workspace *will be deleted* at
+close-out, like S2's — it still exists at this commit, and the present
+tense here was a claim about a pending action. Once it is gone, do not go
+looking for it. The durable record is the git
+history — =39b28c7= (spec) and =f34d2c6= (plan) through =c306465= (Task
+11's fix round), plus this close-out commit — and this section.
+
+** No seventh patch, re-measured at close-out
+
+S3 adds *no* engine change. Re-run as part of this close-out, not carried
+forward from memory:
+
+#+begin_src bash
+$ ls patches/ | wc -l
+       6
+$ git -C tuxemon diff --stat | tail -1
+ 18 files changed, 265 insertions(+), 63 deletions(-)
+$ git -C tuxemon status --short | wc -l
+      20
+$ git -C tuxemon ls-files --others --exclude-standard
+tuxemon/core/clock.py
+tuxemon/core/ids.py
+$ ./.venv/bin/python -c "...; from tuxghost.digest import EXEMPTIONS; print('EXEMPTIONS ==', EXEMPTIONS)"
+EXEMPTIONS == {}
+#+end_src
+
+Same six patches, same 18/265/63, same 2 untracked files, =EXEMPTIONS=
+still =={}=. The 20 short-status lines are those 18 modified plus those 2
+untracked.
+
+** Architecture: no new stepping loop, no new format writer
+
+=seal()= composes four primitives that already existed —
+=boot_from_save=, =install_schedule=, =run_steps= (with =execute='s own
+per-step checkpoint hook) and =Recorder= — and adds no fifth. =run_steps=
+remains *the* loop and =Recorder= remains *the* trace writer, which is
+load-bearing rather than tidy: =tuxghost/trace.py='s =read()= neither
+sorts nor validates same-step input ordering, so a trace written by
+anything other than those writers could replay in file order. S3 never
+writes a trace file directly.
+
+=seal()= exists rather than reusing =run_agent= because =run_agent='s
+scripted path starts its first action at step 0 and therefore cannot
+express a lead-in — true of 1 of the 2 committed traces
+(=walk_1234= waits 30 steps).
+
+** Where =add_edge= lives now — a third option, not either of the spec's two
+
+The spec left =_add_edge='s home open with two candidates, and *neither
+was taken*. Leaving it in =tuxghost/agent/runner.py= makes the optimizer
+depend on the agent harness for one function; moving it to
+=tuxghost/optimize/schedule.py= makes the *agent harness depend on the
+optimizer*, which is worse. =PRESSED=, =RELEASED= and =add_edge= moved
+verbatim to =tuxghost/loop.py=, which already defines =InputSchedule= and
+which both subsystems already import — one edge writer, no
+cross-subsystem dependency. The leading underscore was dropped (the name
+is public across modules now), =tuxghost/agent/runner.py= imports the
+three from there, its local copies were deleted, and
+=tests/test_loop_add_edge.py= covers the move directly.
+
+** =lift= needs =step_count=, not just the edge list — the measured reason =lead_in= exists
+
+Two quantities in a trace leave no input edge behind at all, and both are
+real on the committed traces:
+
+| trace | =step_count= | lead-in before first press | tail after last release | actions |
+|-------+--------------+----------------------------+-------------------------+---------|
+| =claude_town_1234= | 442 | 0 | 10 | 18 |
+| =walk_1234= | 900 | *30* | *400* | 40 |
+
+400 of =walk_1234='s 900 steps are trailing settle and 30 more precede
+its first press. This is not a hypothetical: a naive =lift= over the edge
+list alone produced an action list costing *432* steps for the *442*-step
+=claude_town_1234= — and *the replay's digest matched anyway*, because
+the ten dropped steps changed nothing that had not already settled. A
+digest-only check would have passed a =lift= that silently drops tails.
+That near-miss is why =ActionScript= carries an explicit =lead_in= field
+and why the no-op identity control asserts three things rather than one.
+Both rows above are pinned by
+=tests/test_optimize_schedule.py::test_lift_recovers_the_measured_shape=,
+parametrised over *both* traces — one alone would not catch it, since
+=claude_town_1234='s lead-in is 0.
+
+** The identity result: an unedited script reproduces its parent exactly
+
+=tests/test_optimize_seal.py::test_sealing_an_unedited_script_reproduces_its_parent_exactly=
+asserts all four of:
+
+- =result.trace.inputs == parent.inputs=,
+- =result.trace.header.step_count == parent.header.step_count= *and*
+  =result.steps == parent.header.step_count=,
+- =result.trace.header.final_digest == parent.header.final_digest=
+  (=bc717075d0ba16b8731ae89ddf92f8aa9ff3201429f6766c480f02cded5faf1f=),
+- =result.trace.initial_state == parent.initial_state= — added because
+  =Recorder.__init__= re-snapshots from the *live* session rather than
+  copying =parent.initial_state= verbatim, so =seal='s "verbatim" claim
+  is an invariant about a lossless boot→snapshot round-trip that nothing
+  else asserted.
+
+Inputs, digest *and* step_count. The first probe of this matched inputs
+and digest while silently dropping 10 real steps, which is the whole
+reason the step_count assertion is there.
+
+** =max_cost=: an addition the spec never mentioned
+
+Nothing in the spec bounded how much an editor may grow a script, and
+=HOLD_CAP=/=SETTLE_CAP= are 600 each — so a few thousand inserted actions
+describes a multi-million-step candidate: hours of engine time inside one
+uninterruptible =seal()= call. That is the same reasoning
+=tuxghost/agent/types.py= gives for capping a single action at all, so
+=optimize()= takes a *required* =max_cost= and treats an over-budget
+candidate as a *rejected round*, not a crash. =seal()='s own =max_cost=
+is optional and refuses *before booting anything*, raising =OverBudget=
+(a =ValueError= subclass, so existing broad handlers keep working) so
+that "this candidate was too expensive" stays distinguishable from "this
+parent trace does not boot".
+
+Two places deliberately do *not* pass =max_cost=, both pinned and both
+commented against restoration: =optimize()='s round 0 (the parent is the
+baseline, not a proposal — refusing it would leave the run with nothing
+to compare against) and the CLI's closing re-seal of the winner. The
+second was a real bug: passing =max_cost= there raised =OverBudget=
+uncaught and exited *1* for a plain =--max-cost 400= against the
+442-step parent.
+
+** The parent fixture ends mid-dialogue, and that bounds what S3 can claim
+
+=tests/golden/claude_town_1234.tuxghost= — the only committed trace with
+live-model provenance, and S3's parent throughout — ends at tile
+=[11, 14]= on =spyder_paper_town.tmx= after 442 steps with
+=state_stack == ['DialogState', 'WorldState']=.
+
+*That trailing dialogue swallows every appended input.* Measured, one
+appended action at a time: UP, DOWN, LEFT, RIGHT all leave the tile at
+=[11, 14]=; so do A-then-DOWN and B-then-DOWN. An edit appended after the
+dialogue opens cannot move the player at all.
+
+Measured step effects on the same parent, which *inverted two of the
+plan's own assumptions* — the plan named =Insert(18, DOWN)= the
+"improving" edit and =Delete(0)= the "worsening" one, and both do the
+opposite:
+
+| edit | steps |
+|------+-------|
+| =Delete(last)=, repeated | 442 → 416 → 390 → 364 (better) |
+| =Delete(0)=, repeated | 442 → 416 → 390 (better) |
+| =Insert(18, DOWN)= | 466 (worse) |
+| a long inserted wait, repeated | 442 → 642 → 842 (worse) |
+
+*The consequence, and it is a limit not a feature*: in the nine-run
+tuning sweep, all 60 accepted rounds were accepted on the =ReachTile=
+=steps= term. The =distance= term did *vary* — values from =-2= (the
+parent's own) down to =-9=, from mid-script edits that change the route
+*before* the dialogue opens — but *no candidate in any run ever scored
+better than the parent's =-2=*. The =map= term was =0.0= every round in
+every run; nothing ever left the map.
+
+So the loop's ACCEPT path is exercised only through the =steps= term. *The
+distance term's role in acceptance is untested*, and closing that needs a
+parent fixture that does not end mid-dialogue — not a code change.
+
+(An earlier reading of this fixture concluded the distance term was
+*frozen* for every candidate. That is wrong, measured: it varies. The
+operational conclusion is the same, but the reason is "it never improved",
+not "it never moved".)
+
+*CLOSED, 2026-08-27, by Stream A.* The gap this section names — "the
+distance term's role in acceptance is untested" — is closed, and exactly
+the way this section predicted: with a new parent fixture, not a code
+change. =tests/golden/scripted_town_1234.tuxghost= (176 steps, ends
+=[16, 14]= on a bare =WorldState=) is the optimizer's parent now;
+=claude_town_1234= keeps its live-model provenance role in
+=tests/test_live_capture.py= and is retained as a parametrized
+adversarial case in =tests/test_optimize_runner.py=. Everything above
+remains true *of that trace*; it is no longer true of the suite. See
+"Stream A — finishing S3" below.
+
+** Tuning: measured, and the budget is still the binding constraint
+
+Full raw table in =docs/2026-08-27-optimizer-tuning.org=. Nine CLI runs,
+=MutationEditor= against =claude_town_1234= and
+=ReachTile(spyder_paper_town.tmx, (11, 16))=, seeds 1/2/3 ×
+rounds ∈ {8, 16, 32}, with =patience= and =max_rejections= set equal to
+=rounds= so neither could bind.
+
+*The dumb mutator beats the parent at every budget on every seed — 9 runs
+out of 9.* Best candidate's steps against the 442-step parent:
+
+| rounds | best steps (seeds 1 / 2 / 3) | best round (1 / 2 / 3) |
+|--------+------------------------------+------------------------|
+|      8 | 392 / 414 / 408 | 8 / 8 / 8 |
+|     16 | 374 / 385 / 303 | 13 / 11 / 16 |
+|     32 | 284 / 317 / 262 | 32 / 32 / 28 |
+
+*But 32 rounds has not saturated.* Every run found its best candidate at,
+or within four rounds of, its own cap; all nine stopped with
+=stop_reason == "rounds exhausted"=, never on patience and never on the
+rejection cap. Doubling the budget kept buying improvement at both
+doublings with no sign of flattening. The honest reading is "more than
+32, unmeasured how much more" — *not* "32 is enough". Zero rounds were
+rejected in any of the nine runs, so the sweep says nothing about
+=max_rejections=, and no candidate came near =--max-cost 4000=.
+
+=patience= is *derived, not measured*, from those same runs: 10 is the
+smallest value that would not have truncated any of the nine early
+(seed 3 at 32 rounds found its best — the sweep's best overall, 262
+steps, 41% off the parent — after a 10-round barren stretch). Since
+patience never actually fired, that is a lower bound and nothing more.
+
+No default was adopted in code. =rounds=, =patience=, =max_rejections=
+and =max_cost= all remain required arguments of =optimize()= and of the
+CLI, which is the only honest position while =rounds= has no measured
+ceiling.
+
+Task 8 independently measured seeds 7, 8 and 9 also beating the same
+parent within 12 rounds (best rounds 10, 8, 10).
+
+** Freshly re-measured: a settled end state still cannot detect the improvement
+
+Within one 32-round run (seed 3), candidates from *408 steps down to
+262* — a 146-step spread — all reached the identical final digest
+=b97ebc7c=, and a 438-step candidate reached the parent's own
+=bc717075=. The full round log is in the tuning note.
+
+*"The optimizer improved the trace" can therefore never be established
+from the final digest.* The burden falls entirely on =steps= and on the
+per-checkpoint digest *sequence*, which is why every S3 convergence test
+compares round-by-round score sequences rather than final bests. This is
+S1/S2's attractor lesson (see "Settled end states cannot detect a
+perturbation in this game" above) re-confirmed on S3's own data.
+
+Round 32 of that run also demonstrates the loop requires *strictly*
+better: it tied round 28's winner exactly at =(0, -2, -262)= and was not
+accepted.
+
+** An honest negative: the winner's re-seal is unfalsifiable from the artifact
+
+The CLI re-seals the winning script to stamp its lineage taint rather than
+editing an already-sealed =Provenance= (which would make the CLI a second
+trace writer). *Nothing observable in the resulting artifact distinguishes
+that re-seal from a trace whose =Provenance= was patched after the fact.*
+=Recorder.finish= never passes =recorded_at= — the only field that could
+carry a wall-clock discriminator — and is otherwise a pure function of
+the pinned seed/epoch and the reached state, so the only field differing
+between the loop's best trace and the re-seal is =taints=, which is
+exactly what a patch would set.
+
+The re-seal still earns its keep: one trace writer, plus a free digest
+re-check that the winning script still reaches the score the loop
+recorded (a mismatch is a refusal, exit 2, reported as a determinism
+failure rather than a bad edit). But no assertion over the file can prove
+the re-seal happened, and none pretends to. Verified independently by two
+reviewers; the claim was traced through =record.py=, =trace.py= and
+=runner.py= rather than assumed.
+
+** Validation item 6 was re-specified, because the original described an unwritable test
+
+The spec's item 6 ("=seal()= refuses a clipped candidate") originally said
+to construct a script whose =cost= and =step_count= disagree. Nobody can
+write that test: =seal= derives its budget *from* the script, so its
+input cannot be made inconsistent from outside. The real demonstration
+mutates =seal= itself (pass =script.cost() - 1=) — which is also why
+=seal= installs its step-counting hook *even when =checkpoint == 0==,
+the "do not sample" path. Without the always-on counter there would be
+nothing for the assertion to compare against.
+
+** The CLI's refusals
+
+=optimize= follows =agent='s contract exactly: *0 or 2 for every
+anticipated precondition; 1 is reserved for a genuine engine bug*, since
+=optimize=, like =agent=, has nothing to diverge *from*. The shipped
+exit-2 list is longer than the spec's sketch and is enumerated in the
+spec's CLI section. Two worth naming here:
+
+- =--editor mutation= without =--seed= is refused (an unseeded run would
+  be unreproducible while still *looking* reproducible), *and so is its
+  converse* — any other editor *with* =--seed=. Refusing rather than
+  silently dropping it: dropping would still leave a seed no editor ever
+  used sitting in =run.json= and in the winner's lineage taint, recorded
+  as if it had produced the run.
+- The parent trace is read through =cli._read_trace_or_refuse=, the
+  module's single trace-reading boundary, with =allow_mismatch=False=.
+  The plan's own code used a bare =read()= under
+  =except (OSError, Refused)=, which would have exited *1* ("diverged")
+  for a parent that is merely not valid JSON
+  (=json.JSONDecodeError=) or structurally malformed
+  (=pydantic.ValidationError=) — neither of which is =OSError= or
+  =Refused=.
+
+A known, deferred inconsistency: an unusable =--seed= is refused while an
+unusable =--edits= (or =--model= on =mutation=/=scripted=) is still
+silently ignored.
+
+** Known limitations, each restated as measured or explicitly unmeasured
+
+From the spec's "Known limitations", with what is now known:
+
+- *The objective is a proxy* — *measured, and confirmed to be the binding
+  weakness.* =ReachTile= scored position, and on this parent position
+  could not improve at all, so 60 of 60 acceptances came from the =steps=
+  tie-breaker. It says nothing about whether the *game* progressed. That
+  is S5's job.
+- *=manhattan= across maps is meaningless, so the map term leads* —
+  *unexercised.* The map term was =0.0= in all 9 runs, every round; no
+  candidate ever left =spyder_paper_town.tmx=. The behaviour is pinned by
+  =tests/test_optimize_objective.py=, not by any measured run.
+- *Overlapping button holds are refused, not supported* — *measured on
+  constructed inputs, not on real traces.* Neither committed trace has
+  any (=walk_1234=: 80 edges → 40 clean pairs; =claude_town_1234=: 36 →
+  18). The three refusals (unreleased button, release without press,
+  overlapping holds) are pinned by hand-built traces.
+- *=lead_in= is not editable in v1* — *shipped exactly as specified.* It
+  is preserved verbatim; no =Edit= variant touches it. A run whose only
+  problem is starting too early cannot be fixed by S3.
+- *=state_stack= is names only* — *unchanged, and it bit here.* The
+  parent's =['DialogState', 'WorldState']= is the whole reason its
+  position is immovable, and the optimizer can see the state name but has
+  no seam into what the dialogue is or how to advance past it.
+- *=world_state= is still exactly two fields* (=factions_manager=,
+  =menu_flags=) — *unchanged; S1's widening commitment still never
+  shipped.* A world-state objective would still have almost nothing to
+  read.
+- *=ClaudeEditor= is unreproducible by construction* — *unchanged, and
+  =ReplayEditor= is the mitigation, not a fix.*
+- *One machine* — *unchanged.* macOS 26.6.1 arm64, one Python 3.12, one
+  SDL build.
+
+** Honest limits
+
+- *No live =ClaudeEditor= capture exists.* Unlike S2 — which has a real
+  =claude-sonnet-5= run committed as
+  =tests/golden/claude_town_1234.tuxghost= — S3's =ClaudeEditor= has
+  *never been run against a real model*. Its coverage is stub-client
+  tests only (=tests/test_optimize_claude.py=): prompt shape, JSON-fence
+  parsing, the malformed-reply and =AnthropicError= arms. So the claim
+  "an LLM editor can optimize a trace" is *unmeasured for S3*; what is
+  measured is that a dumb seeded mutator can, which is the baseline such
+  a claim would have to beat. There is no S3 equivalent of S2's
+  live-capture section below because there was no S3 live capture.
+
+  *Until the final fix wave, that capture could not have been run
+  honestly.* =tuxghost.cli._optimize= built =ClaudeEditor(model=model)=
+  and the =optimize= parser had no =--goal= at all, so =ClaudeEditor.goal=
+  was =""=, =build_prompt= skipped its =Goal:= line, and every real
+  =--editor claude= run would have sent the action list, the end tile,
+  the checkpoints and a bare ~Score (higher is better): [0.0, -2.0,
+  -442.0]~ — no target, and no legend for the three numbers (measured;
+  the pre-fix prompt is pasted in the final-fix report). The only claim
+  the spec permits about this editor is a comparison against
+  =MutationEditor= at the same parent, budget and objective, and that
+  comparison would have pitted a blindfolded editor against a sighted
+  seeded baseline. Now fixed both ways: =--goal= exists and mirrors
+  =agent='s, an unset =--goal= derives ~"reach tile (X, Y) on map
+  MAP"~ from =--objective=/=--target=, and =ReachTile.TERMS= is sent as
+  the score tuple's legend. Pinned at the CLI level by
+  =tests/test_optimize_cli.py::test_the_target_reaches_the_claude_editors_prompt=
+  (a stub =anthropic= module records what was actually sent). *The live
+  comparison itself is still unrun.*
+- *The =anthropic= extra stays optional.* The import is lazy and gated on
+  =--editor claude=, so a genuine engine crash on =--editor mutation=
+  cannot have its traceback replaced by =ModuleNotFoundError=. The extra
+  *is* installed in this venv (S2's live capture needed it); the gate
+  does not depend on it.
+- *=ReachTile= is a proxy and this is not a hedge.* See the two entries
+  above: on the one parent that exists, it degenerated to "same place,
+  fewer steps".
+- *One parent, one objective, one editor, three seeds, one machine, under
+  load.* The tuning sweep ran at 1-minute load averages of 13.7–33.1 from
+  unrelated work in other repos, so its wall-clock column is not usable;
+  CPU time and total engine steps sealed are the columns that mean
+  anything. Details and the raw numbers are in the tuning note.
+- *S3 renders nothing.* No =FrameRenderer=, no =scaled_context=, no
+  frames in any run directory — by design, and the =CandidateResult= an
+  editor sees carries no pixels.
+- *A transient =AnthropicError= discards the whole run, and this is the
+  one place the branch's containment philosophy stops.* Everything else
+  an editor can do wrong is contained to a single round: a malformed
+  reply, an out-of-range index, an over-budget script are all logged as
+  rejected rounds and the loop continues. An =AnthropicError= is not —
+  =_optimize='s gated =except Exception= arm sits OUTSIDE the loop, so a
+  rate limit on round 19 of 20 exits 2 having written *no artifact at
+  all*: no winner trace, no =optimize.jsonl=, no =run.json=, and 19
+  rounds of engine time gone. That is correct in the sense that it
+  matches =_agent='s contract and never reports an API problem as a
+  divergence (exit 1) or as the editor's fault; it is a limit in the
+  sense that nothing checkpoints the log as it goes. Closing it means
+  streaming =optimize.jsonl= per round rather than at the end, which is a
+  change to when the file is opened, not to the loop — *unmeasured, not
+  attempted.*
+
+** The final fix wave, after the whole-branch review
+
+One wave, no second round: the whole-branch review found S3 sound in
+architecture and scope but not mergeable on three localized findings,
+plus eight cheap items. All eleven landed. *Every one of the three
+findings and five of the eight items reproduced exactly as described when
+re-checked on this checkout*; nothing was "fixed" on a finding that did
+not reproduce.
+
+*The three findings.*
+
+1. =ClaudeEditor= was never told what it is optimizing toward. Details
+   and the pre-fix prompt are under "Honest limits" above. Fixed BOTH
+   ways the review offered rather than either: a =--goal= flag mirroring
+   =agent='s, AND a derived default from =--objective=/=--target= when it
+   is unset, because an empty string is not a sensible default for
+   something the CLI already knows. A score legend was added too
+   (=ReachTile.TERMS=, sent as one extra prompt line): three unlabelled
+   floats with a sign convention the model has to infer is the same
+   defect in a smaller costume.
+2. =optimize.jsonl= dropped each edit's =op=. Rounds were written with
+   =json.dumps(dataclasses.asdict(entry))=, and =asdict= recurses by
+   FIELD — =Insert= and =Replace= have identical field sets, so a logged
+   insert and a logged replace at the same index were byte-identical, and
+   a logged row fed back through this project's own parser raised
+   =ValueError: edit 0: unknown op None= (re-measured). Each variant now
+   carries an =op= =ClassVar= and a =to_json()=; =_round_json= in
+   =tuxghost/cli.py= serializes through it. =edits_from_json='s accepted
+   shape is unchanged — the point was that what is written can be read.
+   Note the =ClassVar=: it is not a dataclass field, so =__match_args__=
+   is untouched and =apply_edits='s positional =case Insert(index,
+   action)= patterns still work (that positional coupling was on the
+   deliberately-carried list and stayed there).
+3. A claim this branch measured false survived in
+   =tests/test_optimize_runner.py='s module docstring ("=ReachTile='s
+   =distance= term is frozen"). Corrected in place to what was actually
+   measured: it *varies* (−2 down to −9) and has simply never *improved*
+   against this parent, with a pointer here.
+
+*The eight cheap items*, in the review's order: (1) =optimize()= now
+validates =checkpoint >= 0= — a library caller passing =-1= got =i % -1
+== 0= for every step and so a =digest_of= AND a =state_of= snapshot on
+all 442 of them, silently; (2) both editors now read their button values
+from =tuxemon.platform.const.buttons= instead of hardcoding =(1, 2, 4, 8,
+64, 128)= in =MutationEditor= and again in =ClaudeEditor='s prompt; (3)
+four plumbed-but-unasserted paths are now asserted — =seal='s =model=→
+=Provenance.model=, =checkpoint= and =model= through =optimize()= to
+=seal=, and the mutation lineage taint's =seed 7= clause; (4) =_one= in
+=editors/replay.py= now prefixes the EDIT's own position to a malformed
+nested action's message, which previously always said =actions[0]=
+because the index came from the single-item list handed to
+=actions_from_json= — and those messages now reach a user as
+=rejected_reason=; (5) =--max-cost='s =--help= states the
+parent-is-exempt behaviour; (6) and (7) are the two =STATUS.org=
+corrections above; (8) the lineage round count is now rounds that
+actually proposed edits.
+
+*Item 2 is the one change in this wave with no demonstration, and that is
+stated rather than glossed.* Its defect — an upstream remap of, say, =UP=
+and =LEFT= — cannot be reintroduced without editing =tuxemon/=, which
+this project forbids outside a patch. The existing =assert set(_USEFUL)
+<= VALID_BUTTONS= catches a value LEAVING the set and would stay green
+through a remap; reading from =buttons= removes the failure mode instead
+of detecting it. The =UP=1=/=LEFT=4= assertion added to the CLI prompt
+test observes the values reaching the model, but it would also pass
+against the old literals, so it is coverage, not a pin.
+
+** New test counts and the close-out gate
+
+S3 added *eleven* test modules: =tests/test_convention_alignment.py= (2
+tests, written before any other S3 code), =tests/test_loop_add_edge.py=
+(the =add_edge= move), and nine =tests/test_optimize_*.py= modules — one
+per production module — with =schedule= 11, =edits= 13, =seal= 9,
+=objective= 10, =runner= 17, =mutation= 6, =replay= 12, =claude= 14 and
+=cli= 18 tests. The final fix wave took that to =edits= 15,
+=objective= 11, =runner= 19 and =cli= 22 (nine new tests; =seal= and
+=replay= gained assertions inside existing tests rather than new ones).
+
+Baseline entering S3 was S2's *213 passed / 3 skipped / 9 warnings*.
+
+*A full, sequential =make check= at close-out — the first time the slow
+tier has ever been run for S3*, since Task 11's gate was =check-fast=
+only:
+
+#+begin_src bash
+$ ./.venv/bin/python -m ruff check tuxghost tests
+All checks passed!                                  # lint
+All checks passed!                                  # lint-patched
+$ ./.venv/bin/python -m mypy tuxghost tests
+Success: no issues found in 64 source files
+$ PYTHONHASHSEED=0 ./.venv/bin/python -m pytest -q
+347 passed, 4 skipped, 11 warnings in 238.62s (0:03:58)
+$ PYTHONHASHSEED=0 TUXGHOST_RUN_SLOW=1 ./.venv/bin/python -m pytest -q -m slow
+4 passed, 347 deselected, 1 warning in 53.89s
+EXIT=0
+#+end_src
+
+- *Fast tier: 347 passed, 4 skipped, 11 warnings.* 134 net new tests over
+  S2's 213. The 4th skip is new: Task 11 moved the =verify= round-trip
+  behind the =slow= marker.
+- *Slow tier: 4 passed, 347 deselected, 1 warning.* Up from S2's 3 —
+  that same round-trip test. This is S3's first slow-tier evidence of any
+  kind. The one warning is =test_golden.py='s expected =patch_series_id=
+  drift, and the =pytest_sessionfinish= tripwire reported no mismatch.
+- =mypy --strict= now covers *64* source files (was 42 at S2's close).
+- Run sequentially, one suite at a time, per the standing rule against
+  concurrent runs.
+
+*On runtime, because a wrong number here would mislead every future
+session*: the fast tier is *238.62 s (3:58)* on this host at a 1-minute
+load average of 15.3 falling to 5.1 over the run. Two earlier figures for
+the same tier should NOT be inherited:
+
+- =10:52= was measured at *336 tests*, before Task 11's fix round added
+  11 more (three of which boot the engine). Stale by count.
+- =41:54= (2514 s) was measured under a 1-minute load average of *35*,
+  from four unrelated pytest suites plus a VM in other repos — a
+  different repo and venv, so no =~/.tuxemon/cache/l18n= race and no
+  violation of the one-suite rule, but useless as a timing. That run also
+  motivated a warning, recorded during Task 11, that the fast tier now
+  exceeds a 600-second command cap. *That does not reproduce on a
+  quiescent host*: 238.62 s is well under it. The 600-second problem was
+  a property of the machine's load, not of the suite.
+
+The whole =make check= (all five targets) took roughly five minutes wall
+clock under the same falling load.
+
+*** The fix wave's own gate
+
+Re-run in full after the final fix wave, sequentially, on the same host:
+
+#+begin_src bash
+$ ( make check > /tmp/final-fix-gate.log 2>&1; echo "EXIT=$?" >> /tmp/final-fix-gate.log )
+./.venv/bin/python -m ruff check tuxghost tests
+All checks passed!                                  # lint
+All checks passed!                                  # lint-patched
+./.venv/bin/python -m mypy tuxghost tests
+Success: no issues found in 64 source files
+PYTHONHASHSEED=0 ./.venv/bin/python -m pytest -q
+356 passed, 4 skipped, 11 warnings in 332.14s (0:05:32)
+PYTHONHASHSEED=0 TUXGHOST_RUN_SLOW=1 ./.venv/bin/python -m pytest -q -m slow
+4 passed, 356 deselected, 1 warning in 72.50s (0:01:12)
+EXIT=0
+#+end_src
+
+- *=EXIT=0=.* +9 fast tests over close-out's 347, exactly the nine the
+  wave added; skips, warnings and the slow tier's 4 all unchanged.
+- *The =332.14 s= is NOT a timing.* =uptime= before the run reported
+  1-minute load *5.26*; during it, load rose to *11.5–13.8* because an
+  unrelated =pytest= suite was running in =gym-cua-lucidchart= (a
+  different repo and venv, so no =~/.tuxemon/cache/l18n= race and no
+  violation of the one-suite rule — but the CPU is shared). Against the
+  =238.62 s= reference at load ~5, treat this as "still well under the
+  600-second cap" and nothing more. A clean re-measurement needs a
+  quiescent host.
+
+* Stream A — finishing S3
+
+Four items the S3 close-out left open (=docs/2026-08-27-next-session-
+handoff.org=). Three are done and measured; the fourth is half done.
+
+** A1 — the parent fixture, replaced
+
+=tests/golden/scripted_town_1234.tuxghost= is the optimizer's parent
+now. 176 steps, =lead_in 0=, 16 inputs, 8 actions, ends
+=spyder_paper_town.tmx= tile =[16, 14]= facing RIGHT with
+=state_stack == ['WorldState']=, =verify() == 0=, digest
+=9eed41f8f05a2ac5f4ddab969eb3aba46c6768f541d22e01c6f16a45bd9270d6=. Its
+=patch_series_id= matches this build, so it warns *zero* times — the
+same asymmetry =claude_town_1234= has, and it is tracked in
+=tests/conftest.py= on that basis. Recorded by =--policy scripted=, so
+=provenance.recorder= is ="human"=, like =walk_1234=.
+
+The actions file and =run.json= that produced it are committed beside
+it under =tests/fixtures/=; the run directory's =frames/= (580 KB of
+PNGs) deliberately are not.
+
+*Measured, and this is the reason it exists* — with target =(19, 14)=:
+
+| edit | score |
+|------+-------|
+| parent | (0.0, -3.0, -176.0) |
+| append RIGHT ×1 | (0.0, -2.0, -198.0) |
+| append RIGHT ×2 | (0.0, -1.0, -220.0) |
+| append RIGHT ×3 | (0.0, -0.0, -242.0) — arrived |
+| append LEFT ×1 | (0.0, -4.0, -198.0) |
+| delete last ×1 | (0.0, -4.0, -154.0) |
+
+Appended input reaches the player: UP, LEFT and RIGHT all move the end
+tile; DOWN is blocked by a wall. =tests/test_scripted_parent.py= pins
+this, and was demonstrated failing against the retired parent
+(="appending RIGHT did not get closer to the target; this parent's
+input is being swallowed and the distance term is dead"=).
+
+=claude_town_1234= is NOT deleted. It keeps its live-model provenance
+role in =tests/test_live_capture.py= and is retained as a parametrized
+adversarial case in =tests/test_optimize_runner.py=.
+
+*The edit pair inverts, and that is the trap.* Against the retired
+parent a DELETE improved and an APPEND worsened; against this one an
+APPEND toward the target improves and a DELETE *worsens*, because it
+buys steps at the cost of distance and distance outranks steps.
+Demonstrated by giving the new parent the old one's edit kinds:
+=score sequence went backwards: [(0.0, -3.0, -176.0), (0.0, -4.0,
+-154.0), (0.0, -4.0, -154.0)]=. Four further tests turned out to depend
+on the old parent's shape in non-mechanical ways — a hardcoded
+=Insert(18, ...)= that became an out-of-range rejection rather than a
+=max_cost= one, a =_BrokenThenGoodEditor= whose "good" edit stopped
+being good, a =--max-cost 400= that flipped from below the parent's
+cost to above it, and checkpoint expectations that could not
+distinguish =<= from =<== at the boundary.
+
+That last one is now *stronger* than before: 176 is an exact multiple
+of 16, so =checkpoint=16= discriminates whether =step_count= itself is
+sampled. It is not. At 442/64 the next multiple lay past the end
+regardless, so a =<== implementation would have passed untouched.
+
+** A2 — =ReachTile.TERMS[0]= relabelled
+
+=("-off_target_map", "-distance_to_target", "-steps")=. Term 0 is =0.0=
+on the target map and =-1.0= off it, so the old =on_target_map= told a
+model the good value was false. All three terms now read uniformly as
+negated cost, 0 best. Pinned by an invariant over the values, not a
+string comparison: a term that goes negative for the worse of two
+candidates is a cost and must be named as one.
+
+** A3 — =optimize='s =run.json= records =goal=
+
+The effective string handed to the editor, and =null= for the three
+editors that read none — a true statement rather than a dropped field.
+Confirmed in the real baseline runs below: ="goal": null= for
+=--editor mutation=.
+
+*The adjacent gap is now closed too*: =--goal= on a non-claude editor is
+*refused* (exit 2), the =--seed= refusal's missing twin. =run.json= was
+already honest — it records =null=, because no goal reached any editor —
+but a truthful record of a dropped flag is not the same as telling the
+user it was dropped, which is the argument =tuxghost/cli.py= already
+makes for =--seed=. A converse test pins that =--editor claude --goal=
+still works, so the refusal cannot be over-broad.
+
+** A4 — measured, both sides
+
+Six runs, identical parent/objective/target/bounds, three a side. Full
+note: =docs/2026-08-27-editor-comparison.org=. *This is the first
+live-model evidence for =ClaudeEditor= anywhere in this project* —
+model =claude-sonnet-5=, the CLI's resolved default.
+
+| editor | run | stop | best round | best score | arrived |
+|--------+-----+------+------------+------------+---------|
+| claude | 1 | editor returned STOP | 1 | (0, -0, -230) | yes |
+| claude | 2 | rounds exhausted | 3 | (0, -0, -178) | yes |
+| claude | 3 | editor returned STOP | 1 | (0, -0, -230) | yes |
+| mutation | s1 | rounds exhausted | 32 | (0, -0, -186) | yes |
+| mutation | s2 | rounds exhausted | 30 | (0, -2, -125) | *no* |
+| mutation | s3 | rounds exhausted | 19 | (0, -0, -185) | yes |
+
+*Where they separate*: arrival (3/3 vs 2/3) and rounds-to-arrival (round
+1 vs rounds 19-32). All three Claude runs proposed the byte-identical
+first edit =insert index 8, RIGHT, hold 48= — three tiles at 16 steps
+per tile against a target exactly three tiles east. It computed the
+mechanics rather than searching for them.
+
+*Where they do not separate*: final step count. Arriving candidates are
+Claude 178/230/230 against mutation 185/186 — overlapping, and Claude's
+median arrival is worse. Only run 2 beat mutation outright. Mutation's
+shortest trace (125) did not arrive and loses lexicographically.
+
+*Claude's two measured failure modes*: it returned STOP at round 1 in
+two of three runs, leaving 230 steps where the same editor reached 178
+when it kept going; and run 2 then proposed the SAME two edits 29 times
+across rounds 4-32, all scoring =(0.0, -1.0, -176.0)= and none accepted.
+
+*The first evidence in this project that =patience= is a live control.*
+At the =patience = 10= the tuning note derives, run 2 would have stopped
+at round 13 — 19 fewer rounds and 19 fewer API calls, same winner. That
+note could only derive patience as a lower bound because patience never
+fired in its mutation sweep. It fires here.
+
+*CLOSED, later the same day.* =optimize='s run directory now writes
+=answers.jsonl= — the model's own replies, verbatim, one per line, the
+counterpart to =agent='s =decisions.jsonl= and its =raw= field.
+
+The fix is not only the new file. =ClaudeEditor= recorded the reply
+*after* =parse_response=, so a reply carrying no json fence — the single
+failure mode a capture most needs to preserve, and the one S2's missing
+=re.DOTALL= hid behind for sixteen green stub tests — was discarded and
+left no trace anywhere. The append now sits BEFORE the parse, and a
+=calls= counter incremented at the top of =propose= means a call that
+dies before any text arrives leaves a visible GAP in the numbering
+rather than silently shifting every later record down by one.
+
+A second live run was captured as a matched answers+edits pair
+(=tests/fixtures/claude_stop_town.*=) and =parse_response= now has
+coverage against genuinely model-produced text — the direct counterpart
+to =tests/test_live_capture.py='s
+=test_transcript_raw_answers_reparse_to_their_recorded_actions=. Note
+what is and is not new: =re.DOTALL= was ALREADY pinned by a synthetic
+multi-line stub; what had never existed is real text.
+
+The captured replies carry two shapes no stub in this repo produces: a
+fence whose JSON spans multiple lines, and prose BEFORE the fence
+("We already reached the target exactly (19,14). No changes needed.")
+followed by an empty =edits= list.
+
+Committed: =tests/fixtures/claude_optimize_town.{edits.jsonl,run.json}=
+and =tests/test_optimize_live_capture.py=, whose replay control re-runs
+the transcript through =ReplayEditor= and requires the live score
+sequence back.
+
+** The two parked residuals, closed
+
+Items 3 and 4 of S3's four parked residuals (the other two were A2 and
+A3 and are above).
+
+*Residual 3 — a vacuous assertion, confirmed vacuous.*
+=test_the_target_reaches_the_claude_editors_prompt= asserted
+=assert "spyder_paper_town.tmx" in prompt=, which passed against the
+exact defect it was written for: =build_prompt= emits an "Ended on map
+'spyder_paper_town.tmx'" line unconditionally from the candidate's own
+final state, so the map name is present whether or not a goal ever
+reached the prompt. *Measured*: with the goal forced back to =""=, the
+map name still appears *three times* in that prompt. Now asserted
+against the isolated =Goal:= line, which fails with zero goal lines
+found. (The tile half was always real — =(19, 14)= appears only in the
+derived goal.)
+
+*Residual 4 — the pin the fix wave concluded did not exist.* S3's final
+review recorded that nothing could pin Also-fix 2, the replacement of
+hardcoded button numbers in =ClaudeEditor='s =SYSTEM= prompt with values
+read from =tuxemon.platform.const.buttons=. Something can:
+=mock.patch.object= UP and LEFT to each other's values — both still
+valid buttons, so the legend stays well-formed — then =importlib.reload=
+the module, since =_BUTTON_LEGEND= is built at import time.
+
+| implementation | legend | verdict |
+|----------------+--------+---------|
+| reads the constants | =UP=4, ..., LEFT=1= | passes |
+| hardcoded literals | =UP=1, ..., LEFT=4= | fails |
+
+Demonstrated both ways against the reverted literals: the new pin fails
+(=AssertionError: UP=1, DOWN=2, LEFT=4, RIGHT=8, A=64, B=128=) while the
+pre-existing =assert "UP=1" in system and "LEFT=4" in system= *passes*
+against that same reverted code — which is precisely why it was never
+coverage.
+
+** Test state after Stream A
+
+=make check= =EXIT=0= on =impl/finish-offline-optimizer=:
+
+#+begin_src text
+fast: 382 passed, 4 skipped, 11 warnings   in 288.25s (4m48s), load 6.6-11.7
+slow:   4 passed, 382 deselected, 1 warning in 100.85s
+ruff + lint-patched + mypy --strict: green
+#+end_src
+
+Up from S3's close-out =356 / 4 / 11= — *twenty-six* net new tests, 386
+collected against 360. The pinned =patch_series_id= warning table did
+*not* drift; still exactly 11, verified in a SINGLE-session run (the
+gate is a session-finish hook, so a chunked run would not exercise it
+properly). No seventh patch, =patches/= still 6 files, =EXEMPTIONS=
+still =={}=, no format change.
+
+*On timings, and none of these is a clean benchmark.* The 288.25 s above
+was taken at load 6.6-11.7. The cleanest Stream A measurement is an
+earlier gate at *375* tests — 215.32 s — taken as load fell from ~14 to
+2.0, which sits fairly beside S3's 218.00 s at 356 tests and load 4.6.
+The 288 s figure is therefore NOT evidence that the last seven tests
+cost 73 s; most of that is host load. Do not inherit any other figure
+from Stream A at all — several full-suite attempts ran at load 19-29 and
+reported up to 789.93 s, and two background gate runs were killed
+outright mid-run at that load. Check =uptime= before quoting anything
+here, as the S3 handoff already warned.
+
+* S4 — ghost rendering, delivered
+
+A translucent, non-solid, digest-invisible NPC that replays a previously
+recorded trace's positions and facing inside a *live, windowed* session,
+alongside a real human player — plus the one windowed entry point this
+project has, =tuxghost play=. Spec:
+=docs/superpowers/specs/2026-08-27-ghost-rendering-design.org=. Branch:
+=impl/ghost-rendering= (still unmerged — see "What is NOT covered" and
+"Manual acceptance" below for why merging is a human decision, not this
+close-out's).
+
+=tuxghost/ghost/= (=track.py=, =entity.py=, =pump.py=) is the entire
+gated surface; =tuxghost/play.py= is the thin, deliberately-ungated shell
+that wires it to a real window. No seventh patch, no trace-format change,
+=format_version= still *1*, =EXEMPTIONS= still =={}=.
+
+** No seventh patch, re-measured at this close-out
+
+#+begin_src bash
+$ ls patches/ | wc -l
+       6
+$ git -C tuxemon diff --stat | tail -1
+ 18 files changed, 265 insertions(+), 63 deletions(-)
+$ grep -n "^EXEMPTIONS" tuxghost/digest.py
+65:EXEMPTIONS: dict[str, str] = {}
+$ grep -n "^FORMAT_VERSION" tuxghost/trace.py
+54:FORMAT_VERSION = 1
+#+end_src
+
+Same six patches, same 18/265/63, =EXEMPTIONS= still =={}=, trace format
+unchanged and =format_version= unchanged. S4 needed none of the three.
+
+** Three properties make a ghost safe, and all three were DEMONSTRATED, not asserted
+
+=tuxghost/ghost/entity.py='s =install_ghost= puts a second real
+=NPC= (`NPC.create`, sprite ~allie~) into the live session with three
+properties, none of which needed an engine patch:
+
+- *DRAWN, with correct occlusion* — because =MapRenderer._get_npc_surfaces=
+  (=tuxemon/map/view.py=) iterates =npc_manager.npcs= and feeds the
+  layered draw; =NPCManager.add_npc= alone is sufficient. Task 2 pinned
+  this with a real render-inertness gate comparing digest sequences (a
+  stock headless =NullRenderer= frame samples to a single colour; a real
+  =MapRenderer='s frame samples to dozens), and Task 4's animation test
+  installs a real =MapRenderer= and asserts the ghost's own sprite
+  Surface identity actually changes across ticks — reverting the walk
+  step to a no-op produced a real, captured failure ("the ghost's
+  character-sprite Surface identity never changed across 90 ticks after
+  a moved step — a sliding statue, not a walk cycle"), restoring it made
+  the test pass again.
+- *NOT SOLID* — because =CollisionManager= keeps a separate
+  =_entity_map=, populated only by explicit =add_collision= calls, which
+  =install_ghost= never makes. Task 5 demonstrated this directly: the
+  brief's own suggested one-line mutation (a single static
+  =add_collision= call at install time) turned out to be a *vacuous*
+  mutation — it registered collision at the ghost's spawn tile, which is
+  identical to the player's own spawn tile before any step runs, and
+  never updated as the ghost moved, so the test kept passing even with
+  that "fix" applied. The genuine demonstration required a DYNAMIC
+  mutation — wrapping =set_position= to re-register collision at the
+  ghost's current tile on every move — which produced a real, captured
+  failure (the player's end tile shifted from =(16, 14)= to =(15, 12)=,
+  visibly deflected by a solid ghost). Restored, the test passed again.
+  This is a genuine finding about the BRIEF, not about =install_ghost='s
+  (correct) behaviour: a naively-written regression test here would have
+  been the project's seventh vacuous test.
+- *INVISIBLE TO THE DIGEST* — because =tuxghost.digest='s
+  =get_persistent_npc_states= filters on =npc.persistence=, and
+  =install_ghost= overrides it to =False= explicitly (rather than
+  trusting whatever the sprite's own database entry defaults to). Task 5
+  demonstrated this too: flipping that one line to =True= produced a
+  real, captured digest divergence at step 0 (=19662f05… != e60cad02…=)
+  — the ghost's own persistent state leaking into
+  =persistent_npc_state= the instant it was installed. Restored, the
+  per-step digest sequence matched again.
+
+Each of the three has the same shape the project's history warns about:
+a plausible one-line demonstration that would have proven nothing (the
+collision case), caught only because someone ran it and looked at the
+real output rather than trusting the brief's sketch.
+
+** Both Task 1 probe results (measured before any implementation)
+
+- *Translucency*: =set_alpha(128)= on the real sprite Surface objects
+  reachable from =ghost.sprite_controller.get_sprite_renderer()=
+  (=.standing.values()= plus each walk animation's
+  =._frame_manager.images=) works with *no engine patch*. Measured: the
+  same 103 distinct sampled colours before and after, each original
+  saturated sprite colour replaced by one blended toward the ground tile
+  beneath it — the actual signature of alpha blending, not an unrelated
+  change.
+- *Per-step =set_position= alone yields a sliding statue, not a walk*:
+  measured by tracking the =id()= of the character-sprite Surface
+  =MapRenderer._get_sprites= returns across four stepped positions — the
+  *same object* every step, because =set_position= never touches
+  =npc.mover.state=, so =is_moving_state= stays =False= forever and the
+  renderer always takes its static branch. The measured fix (still no
+  patch): drive =npc.mover.state= into =WALKING= and play the matching
+  =SurfaceAnimation= via the existing public
+  =SpriteController.play_animation=/=stop_animation= API whenever the
+  ghost's tile actually changed since the previous call — confirmed
+  directly, the surface identity cycles (2 of 4 distinct) once state and
+  animation are driven together. =advance_ghost= implements exactly this;
+  it is why the module exists as more than a =set_position= wrapper.
+
+Both probes are recorded in full, with real command output, in
+=docs/2026-08-27-ghost-probes.org=.
+
+** The full gate, run alone, per this project's standing rule
+
+#+begin_src bash
+$ uptime   # before starting
+23:28  up 17 days, 12:58, 2 users, load averages: 8.94 9.13 13.23
+$ make check
+./.venv/bin/python -m ruff check tuxghost tests
+All checks passed!                                  # lint
+All checks passed!                                  # lint-patched
+./.venv/bin/python -m mypy tuxghost tests
+Success: no issues found in 75 source files
+PYTHONHASHSEED=0 ./.venv/bin/python -m pytest -q
+404 passed, 4 skipped, 11 warnings in 269.70s (0:04:29)
+PYTHONHASHSEED=0 TUXGHOST_RUN_SLOW=1 ./.venv/bin/python -m pytest -q -m slow
+4 passed, 404 deselected, 1 warning in 54.95s
+EXIT=0
+$ uptime   # after finishing
+00:57  up 17 days, 14:27, 2 users, load averages: 3.61 4.22 5.02
+#+end_src
+
+This is the FINAL gate, re-run after the whole-branch review's fix wave
+(four commits: the vacuous stand-still test, two missing CLI refusals,
+the advance-driven safety coverage, and the sprite). An earlier gate at
+=e5b83e0= measured 402 / 4 / 11 at load 9-40; those counts and that
+timing are superseded by the numbers above.
+
+- *Fast tier: 404 passed, 4 skipped, 11 warnings.* Up from Stream A's
+  382 — 22 net new tests, all four new S4 files (=test_ghost_track.py=,
+  =test_ghost_entity.py=, =test_ghost_pump.py=, =test_play_cli.py=), each
+  tracked in =tests/conftest.py='s =patch_series_id= tripwire with zero
+  pinned warnings (all four were written against the current patch
+  series, so they must warn zero times — and did). The pinned-warning
+  count is unchanged at 11.
+- *Slow tier: 4 passed, 404 deselected, 1 warning* — unchanged from
+  Stream A's 4.
+- =mypy --strict= now covers *75* source files (was 64 at S3 close, then
+  grew through Stream A).
+- =EXIT=0=. Nothing failed.
+
+*On the timing — this one IS usable, unlike the run it replaced.* The
+final gate ran at load *4.37* rising to no more than *5.02*, below the
+~5 this project treats as the threshold past which a full-suite timing
+stops being trustworthy. So *269.70 s at 404 tests* sits fairly beside
+Stream A's *215.32 s at 375 tests* and S3's *218.00 s at 356 tests*,
+both also taken under load 5: twenty-nine more tests for fifty-four more
+seconds.
+
+The EARLIER gate on this branch is the one that must not be inherited.
+It measured 402 / 4 / 11 in *1482.14 s (24:42)* with load starting at
+8.94/9.13/13.23, peaking at *39.80/37.53/29.65*, and still at
+10.27/23.62/27.60 at the end — with an unrelated =pytest= from another
+repo (=gym-cua-lucidchart=, its own =.venv=) sharing the CPU for part of
+the window. That process is NOT a tuxemon suite and never touches
+=~/.tuxemon/cache/l18n=, so it broke no rule and did not contaminate the
+result — but it did share the machine, and 1482 s is not a benchmark.
+Its pass/fail verdict was trustworthy; only its duration was not.
+
+** What is NOT covered — stated plainly, not buried
+
+=make check= runs entirely headless (=SDL_VIDEODRIVER=dummy
+SDL_AUDIODRIVER=dummy=), and =tuxghost/play.py= is therefore *untested by
+construction*: nothing in the gate opens a window, sends a real keyboard
+event, or looks at a single pixel =play.py= draws. This is a *deliberate
+design choice*, not an oversight discovered late — every decision that
+can be gated (whether the ghost is drawn, whether it is solid, whether
+it is digest-visible, whether it animates, the fixed-timestep
+accumulator, the live-recording event installer) lives in the fully
+tested =tuxghost/ghost/= package, and =play.py= is kept deliberately thin
+(99 lines of function body) specifically so that the *only* untested
+surface is the wiring a window forces on it, not any judgment call. See
+Task 8's report for why a test that fakes a window and asserts nothing
+was deliberately not written — this project has already been burned six
+times by tests that passed while proving nothing, and a seventh,
+window-shaped one would be an obvious eighth.
+
+Concretely, NONE of the following has ever been observed by anyone,
+human or automated:
+
+- The window opening at all.
+- The ghost being visible, walking its recorded route, or looking
+  distinguishable from the player.
+- Real keyboard input reaching and moving the player.
+- The world or the ghost rendering at the *correct scale* — see the next
+  section.
+
+** MANUAL ACCEPTANCE — DONE 2026-08-29; see "S4's MANUAL ACCEPTANCE: PERFORMED, and now PASSED"
+
+*This section is no longer current and is corrected here rather than left
+standing, per this project's rule against silently outdated claims.* It
+called manual acceptance "the one outstanding item"; it was performed on
+2026-08-29 and PASSED, but only after finding three defects that were
+live at S4's close-out — the ghost hid after 2.9 seconds, a space bar
+destroyed the recorded session, and =build_track= re-created the display
+and holed the windowed render. The section below described the procedure
+correctly; what it could not know is what running it would find.
+
+The original text follows, unchanged, because the command it gives is
+still the right one.
+
+This is not something this close-out task can perform, and nothing above
+should be read as implying it was. It requires a human to actually watch
+a window. The command:
+
+#+begin_src bash
+tuxghost play --ghost tests/golden/scripted_town_1234.tuxghost \
+  --from-save tests/fixtures/paper_town.save --seed 1234 \
+  --clock-epoch 1787659200 --out /tmp/played.tuxghost \
+  --run-dir /tmp/playrun
+#+end_src
+
+This is the *one* invocation in the entire project that runs *without*
+the dummy SDL drivers — =CLAUDE.md= carries this as its single named
+exception.
+
+A human running it should check, and record what they actually saw
+(including anything that looks wrong, per this project's standing rule
+against describing an expected result instead of a real one):
+
+1. The window opens at all.
+2. The ghost is visible and walks the route recorded in
+   =scripted_town_1234.tuxghost=.
+3. The ghost is visually distinguishable from the player (translucent,
+   per Task 1's probe — but never seen rendered in a real window).
+4. The player can walk *through* the ghost — no collision, no
+   deflection.
+5. After quitting, the recorded trace at =/tmp/played.tuxghost=
+   =verify()=s to 0.
+6. *Specifically*: whether the ghost and the world render at the
+   *correct scale*. Task 8 found that =tuxemon.map.view=/
+   =tuxemon.graphics= bind =tuxemon.prepare.DISPLAY_CONTEXT= at their own
+   first import, and fixed it by importing both modules immediately
+   after =pygame_init()= and before the ghost's internal headless boot —
+   confirmed mechanistically with a headless probe (scale 5 established
+   first is preserved on =map.view=/=graphics='s own bound names even
+   after a later headless =build_client= reassigns the global back to
+   scale 1). But a headless probe can only confirm which number a
+   variable holds; it cannot confirm what the screen actually looks
+   like, and *no human has ever seen the visual result of this fix*.
+
+Until a human runs this and reports back, "the ghost renders correctly
+in a real window" is unverified — the entire feature's actual,
+user-facing behaviour rests on this one check.
+
+* S5 — progress rules and vgbench export, delivered
+
+A =GameRules= interface — =observe(session, step) -> {progress, at_goal,
+dead}= — matching ANON/videogamebench's =scripts/game_rules.py=
+shape term for term, plus a =.tuxghost= -> their trajectory-JSON
+exporter, so this project's runs are describable in their vocabulary.
+Spec: =docs/superpowers/specs/2026-08-29-progress-rules-and-vgbench-export-design.org=.
+Branch: =impl/progress-rules= (still unmerged — merging is the human's
+call, not this close-out's).
+
+=tuxghost/rules.py= (=GameRules=, =TuxemonRules=, =TuxemonGymRules=,
+=TuxemonFirstBattleRules=), =tuxghost/vgbench.py= (=segments_of=,
+=trajectory_of=), =tuxghost/optimize/objective.py='s =RulesObjective=,
+a per-step observer threaded into =tuxghost/optimize/seal.py='s
+=seal()=, and the =export= CLI subcommand. No trace-format change:
+=format_version= is still *1*, the exporter is purely additive.
+
+** No seventh patch, re-measured at this close-out
+
+#+begin_src bash
+$ ls patches/ | wc -l
+       6
+$ git -C tuxemon diff --stat | tail -1
+ 18 files changed, 265 insertions(+), 63 deletions(-)
+$ grep -n "^EXEMPTIONS" tuxghost/digest.py
+65:EXEMPTIONS: dict[str, str] = {}
+$ grep -n "^FORMAT_VERSION" tuxghost/trace.py
+54:FORMAT_VERSION = 1
+#+end_src
+
+Same six patches, same 18/265/63, =EXEMPTIONS= still =={}=, trace format
+unchanged and =format_version= unchanged. S5 needed none of the three —
+matching this project's standing rule that every engine touch is a
+patch and every trace-format touch is a version bump, and S5 makes
+neither.
+
+** The full gate, run alone, per this project's standing rule
+
+#+begin_src bash
+$ uptime   # before starting
+12:39  up 19 days,  2:09, 2 users, load averages: 4.03 4.38 4.70
+$ make check
+./.venv/bin/python -m ruff check tuxghost tests
+All checks passed!                                  # lint
+All checks passed!                                  # lint-patched
+./.venv/bin/python -m mypy tuxghost tests
+Success: no issues found in 80 source files
+PYTHONHASHSEED=0 ./.venv/bin/python -m pytest -q
+446 passed, 4 skipped, 11 warnings in 244.24s (0:04:04)
+PYTHONHASHSEED=0 TUXGHOST_RUN_SLOW=1 ./.venv/bin/python -m pytest -q -m slow
+4 passed, 446 deselected, 1 warning in 51.43s
+EXIT=0
+$ uptime   # after finishing
+12:45  up 19 days,  2:15, 2 users, load averages: 3.64 4.20 4.53
+#+end_src
+
+Re-run a second time end to end, back to back, to confirm the exit code
+explicitly and check for nondeterminism between runs: identical counts
+(446 passed / 4 skipped fast, 4 passed slow), =EXIT=0=.
+
+- *The final gate caught a regression the per-task gates could not.*
+  Every task ran =mypy --strict tuxghost= (35 files); =make check= runs
+  =mypy tuxghost tests= (*80* files), and only the wider one saw
+  =tests/test_rules_seal.py= reading =boot_from_save= off
+  =tuxghost.optimize.seal=, which does not re-export it. Fixed by taking
+  the reference from =tuxghost.boot= while leaving the monkeypatch
+  target on the =seal= module, where it has to stay for =seal= to pick
+  the wrapper up. Worth recording: a green narrow type-check is not a
+  green gate.
+- *Fast tier: 446 passed, 4 skipped, 11 warnings.* Up from S4's 404 — 42
+  net new tests, the three new S5 files (=test_rules.py= 9,
+  =test_rules_seal.py= 10, =test_vgbench_export.py= 12), all three
+  pre-registered in =tests/conftest.py='s =_TRACKED_FILES= tripwire
+  ahead of the tests themselves (SDD ruling R1, so parallel task agents
+  did not collide appending to one tuple) with zero pinned warnings
+  (read fixtures against the current patch series, so all must warn
+  zero times — and did). The pinned-warning count is unchanged at 11.
+- *Slow tier: 4 passed, unchanged from S4.*
+- =mypy --strict= now covers *80* source files (was 75 at S4 close).
+- =EXIT=0=. Nothing failed.
+
+*On the timing.* Load stayed under 5 throughout both runs (started
+4.03/4.38/4.70, ended 3.64/4.20/4.53 on the timed run) — below this
+project's quotability threshold — so *244.24 s at 450 tests* (446 fast +
+4 slow) sits fairly beside S4's *269.70 s at 408 tests* and Stream A's
+*215.32 s at 375 tests*, both also taken under load 5.
+
+** The two goals, and which one is actually exercised by a trace
+
+*Research result.* Tuxemon's Boulder-Badge equivalent is "defeat a gym
+leader," found by ruling out three candidates that look right and are
+inert:
+
+- the =badge= game variable — =is variable_set badge:yes= appears *9
+  times* across shipped maps; =set_variable badge= appears *0* times. It
+  can never become true in shipped content.
+- badge *items* — five exist with =category: badge=; *zero* are
+  referenced by any map event. Never granted.
+- missions — *one* mission file ships (=spyder.yaml=); the fixture save
+  (=tests/fixtures/paper_town.save=) has =missions: []=.
+
+The live path is *13* reachable =classic_gym_*.tmx= maps, each gated on
+=not battle_outcome player,won,classic_gym_leader_<name>= — win once and
+the gate closes permanently, the same latch semantics as a badge bit.
+=TuxemonGymRules.at_goal = n_gyms_won >= 1= reads this directly off
+=BattlesHandler=, which this project's digest already captures.
+
+Because that goal is not reachable by any trace this project can
+currently record (see "What is NOT covered" below), S5 also ships
+=TuxemonFirstBattleRules= (=at_goal = any battle won=) as the goal that
+IS reachable and tested: =tests/test_combat_determinism.py= drives a
+battle to a clean =CombatState= exit at step 4945.
+
+** What is NOT covered — stated plainly, not buried
+
+- =TuxemonGymRules= is *UNREACHABLE* by any trace this project can
+  record. Our longest recorded run is a wild encounter reaching a clean
+  =CombatState= exit at step 4945 from a cold boot; a gym win needs
+  overworld navigation, a building interior, and then the fight. It is
+  exercised only by hand-constructing session state in
+  =test_rules.py=, the same way =tests/test_digest.py= exercises
+  =persistent_npc_state= — never by a trace produced by this project's
+  own recorder or optimizer.
+- =dead= ships *INERT* for the same reason: nothing this project can
+  record ever drives a party to a full wipe, so the =dead= branch of
+  =RulesObjective.score= is real code, tested against hand-constructed
+  state, but never exercised end to end by a real run.
+- =CRITICAL_PATH= has *VERIFIED NAMES but an UNCALIBRATED ORDER*, and
+  is marked =VERIFY= in =tuxghost/rules.py=.
+
+  An earlier draft of this section — and of the code — listed
+  =(spyder_paper_town.tmx, route1.tmx, taba_town.tmx)=, inferred from
+  where the dead =badge= gate happens to be checked. *That was wrong and
+  is corrected*: =route1.tmx= and =taba_town.tmx= belong to a different
+  map family and are unreachable from this project's fixture, so the map
+  term was permanently 0 and =progress= reduced to =party_count * 10= —
+  the objective had *no gradient at all*. The real adjacency, measured:
+  =spyder_route1.tmx= references =spyder_paper_town.tmx=,
+  =spyder_cotton_town.tmx= and =spyder_brideswood.tmx=.
+
+  What remains uncalibrated is the ORDER, not the names. The progress
+  *SHAPING* — the =+1000= term per critical-path index — is therefore
+  still not trustworthy, and the shaping stays *untested* until a trace
+  actually leaves =spyder_paper_town.tmx=: measured on the current
+  parent, round 0 scores =[0.0, 20.0, -176.0]=, where the map term
+  contributes 0 because the run never leaves index 0.
+
+  The GOAL signal (=at_goal=, =n_gyms_won=) does *not* depend on
+  =CRITICAL_PATH=; only the gradient between goal states does.
+- *CLI surface, added in the final fix wave and not in the original
+  plan*: =tuxghost optimize --objective progress= now reaches
+  =RulesObjective= (wiring =TuxemonFirstBattleRules=, the shipped tested
+  goal), with =--target= made per-objective; and =tuxghost export= gained
+  =--run-dir= (writing a =<role>_<model>_<game>_<stage>_<frames>f.json=
+  copy, the frame count DERIVED from the trajectory's own
+  =total_frames=) and =--goal-frame=. =optimize()= also *refuses*
+  =RulesObjective= with =rules=None=, which would otherwise score
+  =(0.0, 0.0, -steps)= on every candidate and silently degenerate to
+  "shortest wins".
+- The exporter's own reach is bounded the same way S4's =play.py=
+  wiring was: this project can verify the export's *SHAPE* (field
+  mapping, run-length coalescing, no-consecutive-duplicate segments) and
+  that their own consumer expression (=scripts/speedrun.py='s
+  =_score_rules_plain= shape) reads a dict with the fields we emit — but
+  *NOT* that their scorer accepts our trajectory end to end. That needs
+  their actual repo, a legal ROM, and PyBoy, none of which this project
+  has or executes (see the spec's non-goals).
+
+* Post-S5 — the keyboard button gap in the exporter, closed
+
+Found while answering "what is left before we can collect traces". This
+is a *defect fixed after S5's close-out*, not part of S5 as delivered.
+
+*The bug, measured:* =tuxghost/vgbench.py='s =_button_names()= mapped six
+buttons — =UP DOWN LEFT RIGHT A B=. Tuxemon defines fifteen. The
+keyboard map =tuxemon/tuxemon/platform/platform_pygame/events.py= (its
+=default_input_map=, line ~307) binds =pg.K_ESCAPE= to =buttons.BACK=
+(16384) and binds *no key at all* to =START= or =SELECT=, which are
+gamepad-only. =Recorder.observe= filters nothing and
+=install_recording_events= records every input the session delivers, so
+a human who opens the world menu once during =tuxghost play= puts =BACK=
+into the trace — and =segments_of= then raised:
+
+: KeyError: 16384
+
+That trace was *permanently unexportable*. Every human-collected trace
+was at risk, which is why this was fixed before any collection began.
+
+*The fix, and why the alias is derived rather than chosen.* Upstream's
+own =tuxemon/tuxemon/platform/tools.py= =keymap= gives =buttons.BACK=
+and =buttons.START= the *identical* intention, =intentions.WORLD_MENU=.
+So =BACK= exports under =START='s name — preserving what the input
+*meant* rather than inventing a name their enum lacks — and the alias is
+computed from that =keymap= at import, never hardcoded. If upstream ever
+gives =BACK= a different intention, the aliasing stops on its own. This
+is the same discipline =_button_names()= already followed for the six
+direct names (read from =buttons=, never literals).
+
+=START= (32) and =SELECT= (16) are now mapped directly; both are in
+their schema's enum and both are gamepad-reachable.
+
+*Unmappable buttons are REFUSED, never dropped.* =MOUSELEFT= (32768),
+=X=, =Y=, =L1/L2/R1/R2=, =HOME=, and the text events =UNICODE= (20001)
+and =BACKSPACE= (20002) have no videogamebench name. =segments_of= now
+raises a =ValueError= naming the value and the step. Silently dropping
+them was the tempting alternative and is wrong: a segment list missing
+an input the trace contains would not reproduce the run it claims to
+describe.
+
+*Consequence, deliberate:* the mapping is now MANY-TO-ONE, so the
+held-set comprehension must deduplicate or a segment holding =BACK= and
+=START= together emits =["START", "START"]= and violates their schema's
+=uniqueItems=. =_NAME_TO_BUTTON= is therefore built from the DIRECT
+names only; the export is a *projection*, not a round trip. =.tuxghost=
+remains the lossless artifact and import stays out of scope.
+
+*All four regression tests were demonstrated to fail against the defect
+they pin*, per this project's non-negotiable rule:
+
+| test | mutation | observed failure |
+|---+---+---|
+| =test_escape_is_exportable_as_start= | =_button_names= restricted to the original six | =ValueError: button 16384 ... no videogamebench name= |
+| =test_back_and_start_together_stay_unique= | =sorted({...})= → =sorted(...)= | =assert 2 == 1=, =={'frame': 1, 'buttons': ['START', 'START']}== |
+| =test_unmappable_button_refuses_rather_than_dropping= | guard deleted | =KeyError: 32768= at =vgbench.py:147= |
+| =test_the_alias_is_derived_from_upstreams_keymap= | alias hardcoded to ={BACK: "START"}= | =assert 16384 not in {16384: 'START', ...}= |
+
+=vgbench.py= was confirmed byte-identical to its pre-mutation copy after
+each restore (=cmp -s= → YES), and =git status= showed only the two
+intended files modified.
+
+*No regression on existing traces:* exporting
+=tests/golden/scripted_town_1234.tuxghost= before and after the change
+produced byte-identical JSON (=cmp -s= → YES). The goldens use only
+button 64 (=A=) and the four directions, so none of them touch the new
+paths — which is exactly why the synthetic tests above exist.
+
+*Gate:* =make check= =EXIT=0=, 450 passed / 4 skipped / 11 warnings in
+286.31s; slow 4 passed; ruff + =lint-patched= + mypy (80 files) clean.
+Load 3.02 → 4.24 across the run. 446 → 450 (+4).
+
+** Their Pokemon traces do not exist yet — measured, not assumed
+
+Worth recording because it reframes "how far are we from their Pokemon
+traces". All 21 files in =~/Workspace/videogamebench/results/speedrun/=
+are =sml_1-1= (Super Mario Land). There is *no* Pokemon trajectory.
+=sandbox/POKEMON_SETUP.md= states the blocker plainly: "*ROM (hard
+blocker):* drop a legal dump at =roms/pokemon_red.gb=. Nothing can be
+tested without it." =roms/= is absent. Their =PokemonRedBrockRules=,
+=pokemon_calibrate.py= and docker profile are written and unexecuted.
+
+*Their JSON schema is stale — do not validate against it.*
+=sandbox/trajectory_schema.json= sets ="additionalProperties": false=
+and allows only ={segments, total_frames, fps}=, which forbids =type=,
+=game= and =goal_frame= — keys present in *every one* of their own 21
+outputs. Key frequency across those files, measured:
+
+| key | in their files | ours |
+|---+---+---|
+| =type=, =game=, =fps=, =total_frames=, =segments= | 21/21 | emitted |
+| =goal_frame= | 16/21 | optional |
+| =rom=, =started_at=, =boot_frames=, =rationale= | 1/21 each | deliberately omitted |
+
+So our export already matches their *de facto* format key-for-key. Their
+files are the specification; the schema file is a fossil.
+
+Their progress function is =n_badges*1e6 + furthest_critical_path_map*1e3
++ party_count*10=; ours is the same shape with =n_gyms_won*1e9=. Their
+=dead= is an open TODO ("currently always False"); ours detects a party
+wipe. Both sides carry the same unresolved =CRITICAL_PATH= ordering,
+marked =VERIFY= in both repos.
+
+* S4's MANUAL ACCEPTANCE: PERFORMED, and now PASSED
+
+*Status: SATISFIED, 2026-08-29.* A human confirmed, in their own words,
+"I can see it, it works". This closes the item that had been outstanding
+since S4 shipped, through S5 and two fix waves.
+
+It did not pass on the first attempt. The first windowed run found THREE
+defects, all recorded below, all fixed; the confirmation above is of the
+tree AFTER those fixes (=main= at =8840756=).
+
+*What was actually confirmed.* A ghost-race clip: the live character
+driven by =tests/golden/claude_town_1234.tuxghost= (442 steps) while the
+ghost replays =tests/golden/scripted_town_1234.tuxghost= (176 steps) —
+same save, same seed 1234, same clock epoch 1787659200, same map. Both
+are real recorded traces; nothing was synthesised for the demonstration.
+The ghost completes its route at step 176 and stands at tile (16,14) for
+the remaining 266 steps.
+
+*Three independent confirmations accompany the human's, so this does not
+rest on one pair of eyes:*
+
+- *Pixel diff.* Rendering the final frame with and without the ghost
+  installed and differencing them yields exactly ONE changed region,
+  70×100 px at (1010, 295). The ghost is drawn, and it is the only
+  thing it changes.
+- *Digest invariance.* Final digest with ghost (run 1) = with ghost
+  (run 2) = WITHOUT ghost = the trace's own recorded =final_digest= =
+  =bc717075d0ba16b8731ae89ddf92f8aa9ff3201429f6766c480f02cded5faf1f=.
+  The ghost is drawn but state-invisible, measured rather than asserted.
+- *Render fidelity.* Headless output is byte-identical to windowed since
+  the =build_track= context fix, so the clip is a faithful stand-in for
+  what the window shows.
+
+*One honest caveat, recorded rather than buried:* re-rendering the clip
+does NOT produce a byte-identical GIF — consecutive runs came out at 109
+and 106 frames, because animation phase and dialogue timing differ
+between runs. The four digests above are identical regardless. That is
+exactly the guarantee this project makes and no more: a window changes
+what is DRAWN, never what HAPPENS.
+
+The clip itself was a throwaway: a script under the job's tmp directory,
+no =tuxghost= subcommand, nothing committed. If a ghost video is ever
+wanted as a real feature it is unbuilt, and would need its own spec.
+
+** The three defects the acceptance found — and why it had to be a human
+
+The item outstanding since S4 closed. A human ran =tuxghost play= at a
+real window on 2026-08-29 and reported: *"I don't see the ghosts"*.
+Every automated test passed throughout. Two defects, both invisible to
+the suite, and one of them destroyed the session.
+
+*A test suite cannot see a three-second window, and cannot see a
+translucent sprite at all.* S4 shipped with three ghost properties
+"DEMONSTRATED, not asserted", a fully green suite, and a documented claim
+that the feature worked. All three defects below were live at that
+moment. The single manual step was the only thing that could have caught
+any of them, and it sat undone across two subsequent subsystems.
+
+*** Defect 1 — the ghost was visible for 2.9 seconds, then hidden forever
+
+*Not an implementation bug.* =advance_ghost= did exactly what S4
+designed and what =test_the_ghost_is_hidden_past_the_end_of_its_track=
+asserted: past the end of its track, hide. The reasoning recorded there
+was "a ghost standing motionless at its final tile forever reads as a
+bug". That was written by someone who had never watched it run.
+
+The walking fixture =tests/golden/scripted_town_1234.tuxghost= is *176
+steps* — 2.9 seconds at 60fps. The ghost completed its whole route while
+the window was still opening, and =track.at(177)= returned =None=, so it
+was hidden for the entire rest of the session.
+
+Measured before any change, at the real =advance_ghost= call site:
+
+| step | on map? | ghost tile |
+|---+---+---|
+| 1 | True | (12, 12) |
+| 50 | True | (12, 14) |
+| 175 | True | (16, 14) |
+| 176 | True | (16, 14) |
+| 177 | *False* | — |
+| 399 | *False* | — |
+
+Two controls ruled out the obvious suspects first: the ghost *is* drawn
+(installing it changes the rendered frame — compared as raw RGB bytes,
+=before != after=), and it *does* walk the route correctly (tiles match
+=track.at(step)= at every sampled step). Rendering was never broken.
+
+*Reversed, on the human's decision:* past the end of its track the ghost
+now STANDS at its final recorded tile. That tile is a real recorded
+position — the one the trace actually ended on — not the stale mid-track
+position the original reasoning worried about. A ghost waiting at its
+finish line is what a ghost race looks like. After the change, measured
+the same way: visible at step 1200 (20 seconds), still at (16, 14).
+
+An empty track still hides the ghost: the linger reads
+=track.frames[-1]=, and there is no final tile to stand on.
+
+*** Defect 2 — a space bar destroyed the whole recorded session
+
+=tuxemon.platform.const.events= shares the =PlayerInput.button= channel
+with real buttons — =QUIT= (20000), =UNICODE= (20001), =BACKSPACE=
+(20002) — and a =UNICODE= event carries the typed CHARACTER as its
+=value=, not a float. =Recorder.observe= filtered nothing, so pressing
+SPACE put =(step, 20001, ' ')= into =_inputs=, and =finish()= died:
+
+: pydantic_core.ValidationError: 27 validation errors for Trace
+: inputs.245.2  Input should be a valid number, unable to parse string
+:               as a number [input_value=' ', input_type=str]
+
+*At write time, on quit* — after the session had been played. The whole
+recording was lost. This is the same class of defect as the exporter
+button gap fixed earlier the same day, one layer deeper: both came from
+assuming the six overworld buttons were the only thing a human produces.
+
+*Fixed by dropping non-button events and TAINTING the trace*
+(=DROPPED_NON_BUTTON = "dropped_non_button_input"=). Dropping keeps the
+session writable; the taint keeps it honest, because a run whose text
+entry was discarded will not replay faithfully. =tuxghost.cli='s
+=compare= already surfaces taints as findings, so this costs no new
+reader. The value guard is separate from the button guard on purpose,
+and =bool= is excluded explicitly — it is an =int= subclass, and
+=float(True)= would silently record 1.0.
+
+*** All four regression tests were demonstrated to fail
+
+| test | mutation | observed failure |
+|---+---+---|
+| =..._does_not_destroy_the_trace_at_write_time= | =observe='s filter removed | =pydantic_core.ValidationError: 1 validation error for Trace= |
+| =..._taints_the_trace= | =_taints.append= removed | =assert [] == ['dropped_non_button_input']= |
+| =..._stands_at_its_final_tile_past_the_end...= | linger disabled (S4's behaviour) | =assert 'ghost' in {'npc_red': ...}= |
+| =test_an_empty_track_still_hides_the_ghost= | empty-track guard removed | =IndexError: tuple index out of range= |
+
+=record.py= and =ghost/entity.py= both confirmed byte-identical to their
+pre-mutation copies afterwards. =test_a_clean_recording_is_not_tainted=
+is the deliberate CONTROL for the taint test: an assertion that a taint
+appears proves nothing if the recorder taints unconditionally, and this
+project has shipped exactly that class of vacuous test before.
+
+*Gate:* =make check= =EXIT=0=, 455 passed / 4 skipped / 11 warnings in
+245.55s; slow 4 passed; ruff + =lint-patched= + mypy (80 files) clean.
+Load 3.56 → 2.93. 450 → 455 (+5, one being the new control).
+
+*** The lesson, stated plainly
+
+S4 shipped with three ghost properties "DEMONSTRATED, not asserted", a
+full green suite, and a documented claim that the feature worked. It did
+not. The single outstanding manual step was the only thing that could
+have caught either defect, and it sat undone across two subsequent
+subsystems. *A test suite cannot see a three-second window.*
+
+* Defect 3 — the windowed render was full of holes, and why
+
+Found immediately after the two defects above, in the SAME manual
+acceptance session: the human reported "there is a black tiling thing".
+
+*Symptom:* windowed, the map draws with large blank rectangles where
+sprites and many tiles should be. The player and every NPC are missing.
+Opaque ground tiles survive; everything needing alpha does not.
+
+*Root cause:* =build_track= called =boot_from_save= with no =context=, so
+=build_client= fell through to =tuxghost.boot.headless_context()=
+(=boot.py:202=), which calls =pg.display.set_mode()= a SECOND time. A
+second =set_mode= invalidates every surface already converted against
+the first display — so the real client's already-loaded sprites and
+alpha tiles became garbage and drew as blank.
+
+=boot_from_save= has accepted a =context= parameter all along, and
+=tuxghost.play= passes it for the REAL session. =build_track= never
+accepted one. Fixed by giving it the parameter and having =play= forward
+the windowed context.
+
+*This is the second, independent half of the hazard =play.py='s
+"Ordering note 2" describes.* That note forces =tuxemon.graphics= and
+=tuxemon.map.view= to bind the windowed SCALE before the ghost build
+runs, and it works — measured this session, both modules bound at scale
+5 matching the real context. It says nothing about the display being
+re-created underneath them, which is this defect. Ordering note 2 was a
+correct fix to a different problem that shares a cause.
+
+*Measured, windowed, 120 steps, seed 1234, epoch 1787659200:*
+
+| build_track called with | frame bytes | matches headless? |
+|---+---+---|
+| no context (the defect) | 18772 | no — visibly holed |
+| a context (the fix) | 17302 | *byte-identical* |
+| not called at all (control) | 17302 | byte-identical |
+
+Each row reproduced TWICE. The track itself is unaffected either way:
+177 frames, last =GhostFrame(spyder_paper_town.tmx, (16,14),
+Direction.RIGHT)=.
+
+** A wrong diagnosis, corrected — recorded because the correction is the point
+
+The first hypothesis was that =tuxghost.observe='s =FrameRenderer= built
+its compositing surface as a plain =pg.Surface= with no =.convert()=, so
+display-format sprites blitted onto it wrongly. Adding =.convert()=
+appeared to fix it: the frame went to 17302 bytes, byte-identical to the
+headless control. That looked conclusive and was wrong.
+
+Two checks killed it. =convert()= changes NOTHING measurable here —
+=plain= and =convert= both report =bitsize 32=, masks
+=(16711680, 65280, 255, 0)=, =flags 0=, =alpha None=, =colorkey None=,
+=bytesize 4=, under both dummy and a real window. And re-running the
+UNFIXED configuration twice produced the clean 17302 image both times.
+The artifact had never been about =convert()=: the experimental script
+that "proved" the fix had silently dropped the =build_track= call.
+
+*A fix that works is not a diagnosis.* The confounder was invisible until
+the unfixed case was re-run, which is the only reason it was caught.
+=observe.py= was restored and is unchanged on disk.
+
+** Why no headless test can catch this
+
+=make check= runs entirely headless, where there is no first display to
+invalidate, so BOTH paths render identically — the pixel evidence above
+only exists windowed. A pixel assertion in the suite would pass whether
+or not the bug were present: precisely the vacuous-test trap this
+project keeps re-discovering.
+
+So =test_build_track_reuses_a_given_context_instead_of_reinitialising=
+asserts the CALL instead: given a context, =headless_context()= must not
+be reached. Demonstrated to fail against the defect — dropping the
+=context=context= forwarding gives =AssertionError: [1, 1]= (called
+twice, not once) — with =track.py= confirmed byte-identical after
+restore.
+
+*Gate:* =make check= =EXIT=0=, 456 passed / 4 skipped / 11 warnings in
+272.15s; slow 4 passed; ruff + =lint-patched= + mypy (80 files) clean.
+
+A first =make check= on this change FAILED (=EXIT=2=) on two unused
+=type: ignore= comments, because mypy had been run before the new test
+was added rather than after. That is the same lesson recorded in the S5
+section, repeated within the same day: *run the gate's own command after
+the last edit, not before it.*
+
+* The three deferred S5 residuals, closed
+
+All three were logged as non-blocking at S5's close-out and are now done.
+
+** =--goal-frame= was the last unvalidated numeric CLI boundary
+
+Every other numeric argument in =tuxghost.cli= is checked rather than
+trusted; this one was not. Now refuses =< 0= with exit 2.
+
+*NO UPPER BOUND, deliberately.* A =goal_frame= past =total_frames= is
+legitimate in their own corpus: =agent-kimi_sml_1-1_3047f.json= records
+=goal_frame= 3173 against =total_frames= 3057. An upper bound here would
+refuse files they actually ship. Only negativity is meaningless, and
+=test_a_goal_frame_past_total_frames_is_accepted= is the control that
+keeps someone from "tightening" this into a defect.
+
+** The verbatim-duplicated =--target= comment
+
+A five-line comment block appeared twice, consecutively. Deleted one.
+
+** Spec item 12 was under-enforced — and the fix is smaller than it looks
+
+Item 12 requires our key set be a subset of *their =gold_human= file's*.
+The tests instead asserted against a hardcoded TEN-key literal that was
+the UNION of every key across all 21 of their files.
+
+Now measured, not typed: =tests/fixtures/vgbench_reference_keys.json=
+carries their =gold_human= key set, that file's sha256, and the corpus
+key frequency, all derived from their repo rather than written by hand.
+=test_the_vendored_reference_still_matches_their_repo= re-derives and
+compares whenever their repo is checked out, and skips otherwise, so the
+suite stays portable.
+
+*A tension item 12's wording hides.* =gold_human= has EIGHT keys and
+=goal_frame= is not among them — it is a human reference run with no
+scored goal. But =goal_frame= is unambiguously part of their format:
+16 of their 21 files carry it. So the strict item-12 ceiling holds for
+our DEFAULT export and *cannot* hold once =--goal-frame= is used. Both
+halves are now asserted, so neither drifts silently.
+
+*How much this actually tightened, stated precisely — the first version
+of this note overclaimed and a mutation caught it.* The union admitted
+=goal_frame= and =rationale=; =gold_human= does not. That is the whole
+tightening: two keys. It does NOT newly catch =rom= or =started_at=,
+which this exporter promises never to emit — both ARE in =gold_human=,
+so neither ceiling would notice them. That gap needed its own test,
+=test_started_at_and_rom_are_never_emitted=. A promise no test checks is
+not a promise.
+
+** The demonstrations, including one that documents a LIMIT
+
+| mutation | ceiling test | gap test |
+|---+---+---|
+| =--goal-frame= check removed | =AssertionError= (exit 0, wrote the file) | — |
+| emits =rationale= (outside =gold_human=) | *FAILS* — caught | — |
+| emits =started_at= (inside =gold_human=) | *passes* — misses it, as documented | *FAILS* — caught |
+
+The third row is the point: it proves the ceiling's documented blind
+spot is real and that the separate test is what closes it. =cli.py= and
+=vgbench.py= both byte-identical after restore.
+
+*Gate:* =make check= =EXIT=0=, 461 passed / 4 skipped / 11 warnings in
+285.27s; slow 4 passed; ruff + =lint-patched= + mypy (80 files) clean.
+456 → 461 (+5).
+
+* CRITICAL_PATH calibrated, and the gym goal shown to be UNREACHABLE
+
+Both were assumptions carried since S5, marked =VERIFY= in the code and
+never measured. Both are now measured, from the shipped map data.
+
+*Method.* Every =transition_teleport player,<map>.tmx= in all 263 =.tmx=
+files under =tuxemon/mods/tuxemon/maps/= parsed into a directed graph —
+472 edges over 199 maps with outgoing links — then breadth-first
+searched from =spyder_paper_town.tmx=, which is the map the committed
+save actually boots on (read from the save, not assumed). Parsing all
+263 maps takes 0.04s, so this lives in the fast suite.
+
+This is the same calibration their =scripts/pokemon_calibrate.py= exists
+to perform, and which =POKEMON_SETUP.md= lists as their blocker #2. They
+cannot run theirs — it needs a ROM they do not have. Ours needed no such
+thing: the map data is right there in the tree.
+
+** CRITICAL_PATH's ORDER was right all along — now with evidence
+
+| map | hops from start |
+|---+---|
+| =spyder_paper_town.tmx= | 0 |
+| =spyder_route1.tmx= | 1 |
+| =spyder_cotton_town.tmx= | 2 |
+
+Strictly increasing, exactly the order the tuple already declared. The
+=VERIFY= marker was correct to raise — adjacency alone genuinely could
+not settle it, since =spyder_route1= is a hub touching all three towns —
+and the answer turned out to be the one already written. Markers removed
+and replaced with the measurement.
+
+*Demonstrated:* reversing the tuple fails
+=test_critical_path_is_ordered_by_real_map_distance= with
+=assert [2, 1, 0] == [0, 1, 2]=.
+
+** The gym goal is not "far". It is DISCONNECTED.
+
+=TuxemonGymRules='s docstring said "NOT REACHABLE ... See the spec's
+'horizon problem'". That framing is too weak and is corrected: a horizon
+problem implies a long-but-possible search. Measured:
+
+- All 13 =classic_gym_*.tmx= maps sit in a *22-map connected component
+  containing NO =spyder_*= map at all*.
+- =spyder_paper_town.tmx= reaches 88 maps directed, 94 undirected. Zero
+  are gyms.
+- Checked UNDIRECTED as well as directed, deliberately: a one-way link
+  would still make the goal reachable, and testing only the directed
+  graph would have missed it.
+
+The =classic_*= campaign and the =spyder_*= campaign are separate games
+that happen to ship in one mods directory. *No amount of search time
+crosses that.* =TuxemonGymRules= is aspirational until a =classic_*=
+starting save exists; =TuxemonFirstBattleRules= is the goal anything
+actually runs against today, exactly as its docstring already said.
+
+*Demonstrated:* adding a SINGLE edge from =spyder_cotton_town= to
+=classic_gym_astra= makes all 13 gyms reachable and fails
+=test_no_gym_is_reachable_from_the_starting_map=. That is the test's
+purpose — if a vendor bump ever connects the campaigns, it fails, and
+that is the moment to revisit =TuxemonGymRules=.
+
+** Why these are tests and not comments
+
+Both facts are properties of 263 vendored =.tmx= files, which =make
+patch= can replace without touching a line of our code. A comment
+recording a measurement goes stale silently; a test re-derives it on
+every run. =tests/test_rules_mapgraph.py= also re-reads =START= from
+=tests/fixtures/paper_town.save= rather than trusting the literal, so
+the other two assertions cannot quietly become vacuous by pointing at
+the wrong starting map.
+
+*Gate:* =make check= =EXIT=0=, 464 passed / 4 skipped / 11 warnings in
+268.41s; slow 4 passed; ruff + =lint-patched= + mypy (81 files) clean.
+461 → 464 (+3).
+
+* A second save fixture — =hearthrock_city.save=, where the gym goal can fire
+
+Direct consequence of the disconnection measured above. =paper_town.save=
+lives in the =spyder_*= campaign; all 13 gyms live in the =classic_*=
+one; the two share no path. So =TuxemonGymRules= could never fire from
+the only starting state this repo had. This adds one where it can.
+
+** Why Hearthrock City, specifically
+
+Measured from the map graph, not chosen by taste:
+
+- It is the ONLY city in the =classic_*= component with *two* gyms on it
+  — Granite and Mila — both *one hop* away.
+- It links to =classic_route_1=, so it is the campaign's first city.
+- Both leaders exist as real NPCs in those maps
+  (=classic_gym_leader_granite=, =classic_gym_leader_mila=).
+
+** Reachable is not the same as winnable
+
+Both leaders field =hydrone,20= and =nudikill,20= — read from the map
+data, not guessed. A level-5 party like =paper_town.save='s would have
+made the gym goal reachable in TOPOLOGY and unwinnable in PRACTICE,
+which moves the problem rather than solving it. The fixture ships two
+monsters at level 25 and two potions: a fair fight against two at 20,
+not a walkover.
+
+=test_the_party_can_actually_meet_the_gym_leaders= re-reads the leaders'
+levels from the =.tmx= files on every run, so a vendor bump that raises
+them fails the test instead of silently leaving the fixture too weak.
+
+** What the artifact actually does, verified rather than assumed
+
+| property | result |
+|---+---|
+| boots to | =classic_hearthrock_city.tmx=, tile (23,14) |
+| state stack | =['WorldState']= — bare |
+| party | rockitten 25, budaye 25 |
+| digest, two boots + 120 steps | =45dea604…5bd74f75=, identical |
+| gyms reachable (directed) | Granite and Mila, 1 hop each |
+
+The bare =WorldState= is worth asserting rather than trusting: the
+generator runs through a cold boot, so =ChoiceState= and =ImageState=
+ARE on the stack while it works. =SaveData= carries no state stack, so
+they do not survive into the artifact — measured, not inferred from the
+docstring that says they cannot.
+
+The spawn tile was probed before being chosen: four candidates were
+teleported to and stepped forward 90 frames; all four stayed put, so
+(23,14) does not re-trigger the gym door it sits outside.
+
+*** Demonstrations
+
+| mutation | observed failure |
+|---+---|
+| party levels → 5 | =AssertionError: ([('rockitten', 5), ('budaye', 5)], 20)= |
+| =current_map= → =spyder_paper_town.tmx= | =AssertionError: no gym reachable from spyder_paper_town.tmx= |
+
+The fixture was confirmed byte-identical to its pre-mutation copy after
+each restore.
+
+*Gate:* =make check= =EXIT=0=, 468 passed / 4 skipped / 11 warnings in
+351.53s; slow 4 passed; ruff + =lint-patched= + mypy (83 files) clean.
+464 → 468 (+4).
+
+*That 351.53s is NOT comparable to the 268.41s above.* Load rose from
+4.61 to 6.69 across the run — the highest this session — so the figure
+measures the host, not the suite. Quote the 268.41s at load ~4 instead.
+
+* The first real optimizer run from the classic campaign — four runs, three defects
+
+The experiment the =hearthrock_city.save= fixture existed for. It found
+three defects, all in the progress SHAPING, none of which a green suite
+had noticed. Every one was found by running the thing, not reading it.
+
+** Run 1 — the map term was dead
+
+Round 0 scored =[0.0, 20.0, -600.0]=. That 20.0 is =party_count * 10=
+and nothing else: =CRITICAL_PATH= named only =spyder_*= maps, which are
+unreachable from this save, so =_map_index= returned 0 forever. The
+identical defect M1 was, relocated to the other campaign. Fixed by
+making the lookup search =CRITICAL_PATHS= (per-campaign) rather than one
+hardcoded tuple.
+
+** Run 2 — the gradient was too sparse to climb
+
+Re-ran with a =CLASSIC_CRITICAL_PATH= built from CITIES. Every round
+still scored 20.0. The nearest credited city is TWO hops from the start,
+so the search faced a two-map plateau with no signal anywhere on it. A
+gradient that pays only on arrival at a city is not climbable by an
+editor proposing button sequences. The =spyder_*= path had this right by
+accident — it lists =spyder_route1=. Fixed by including the routes.
+
+** Run 3 — gyms were excluded, and they are the nearest progress there is
+
+Still 20.0. Gyms had been left out as "the goal, not the path", which
+sounds principled and is wrong here. Measured from the save's own spawn
+tile (23,14): *holding UP for exactly 20 steps enters
+=classic_gym_granite.tmx=* — the gym door is directly above the player.
+Excluding gyms denied credit for the single most reachable act of
+progress in the whole campaign. Fixed by placing them at their real hop
+distance like everything else. =CLASSIC_CRITICAL_PATH= is now 22 entries
+over hops 0..8.
+
+** Run 4 — the pipeline is CORRECT, and the editor is searching blind
+
+Still 20.0 across 13 rounds. So the scoring path was tested directly
+rather than blamed:
+
+: seal(ActionScript(actions=(Action(UP, hold=40, settle=560),)), parent)
+:   -> max_progress = 1020
+
+*One action scores 1020 against the parent's 20.* =HOLD_CAP= is 600, so
+that action is comfortably expressible; the parent is 600 steps of no
+input. The rules, the seal wiring, the objective and the map term are
+all correct end to end.
+
+What is not correct is the editor's INFORMATION. It sees only the score
+tuple =(goal_state, max_progress, -steps)=. With =max_progress= pinned
+at 20.0 it is climbing a plateau with no signal at all, and it has no
+map name, no tile position, and no hint that UP leads anywhere. Thirteen
+rounds against a live model never proposed the one action a five-line
+probe found. *That is the next thing to fix, and it is a prompt/feedback
+problem, not a rules problem.*
+
+** The test that should have existed first
+
+=test_one_action_beats_the_parent_from_the_hearthrock_save= (slow) seals
+both the lifted parent and the one-action script through the REAL =seal=
+path and asserts 20 → 1020. Dropping =CLASSIC_CRITICAL_PATH= from
+=CRITICAL_PATHS= fails it with =AssertionError: 20= *in 3.78 seconds* —
+what four live-model runs took roughly fifteen minutes to merely hint
+at. An integration test against a real fixture would have caught all
+three shaping defects immediately.
+
+Its own first draft was wrong in an instructive way: it used
+=ActionScript(actions=())= as the idle baseline, which runs ZERO steps,
+observes nothing, and returns =max_progress = 0= — indistinguishable
+from a dead gradient. =optimize()= builds round 0 with =lift(...)=, and
+so must this. The comment in the test now says so.
+
+** A control that stopped controlling, twice, in one sitting
+
+=test_a_map_on_no_critical_path_scores_only_the_party= first used
+=classic_route_1.tmx=, which became on-path when routes were added, then
+=classic_gym_granite.tmx=, which became on-path when gyms were added.
+Both times it failed loudly, which is the only reason it was noticed. It
+now ASSERTS its premise — that its chosen map is on no path — so it
+cannot silently become vacuous a third time.
+
+*Gate:* =make check= =EXIT=0=, 472 passed / 4 skipped / 11 warnings in
+308.08s; slow 5 passed; ruff + =lint-patched= + mypy (83 files) clean.
+468 → 472 (+4). A first attempt failed =EXIT=2= on =Action= not being
+explicitly re-exported by =tuxghost.optimize.schedule= — *the third time
+this session that mypy was run before the last edit rather than after.*
+
+* The optimizer reliably moves =max_progress= — 4 of 5 runs, n=5
+
+*This heading has been rewritten twice and both earlier versions were
+wrong in opposite directions.* At n=1 I called the hypothesis confirmed;
+at n=2 I called it "weak evidence, not a working search". Neither sample
+could see what n=5 shows. The sequence is preserved below because the
+error is instructive: a single run is not evidence, and two runs are not
+much better when the dominant variable is a language model's sampling.
+
+** THE OPTIMIZER MOVED max_progress FOR THE FIRST TIME
+
+Round 8 of a run from =hearthrock_city.save= scored
+=[0.0, 1020.0, -1120.0]=. Before that, across four runs and 37 rounds,
+=max_progress= had never once left 20.
+
+*** The cause was not what I said it was
+
+I reported that the editor "sees only the score tuple: no map name, no
+tile, no hint that UP leads anywhere". *That was wrong, and it was wrong
+because I inferred it instead of reading =build_prompt=.* The prompt has
+always carried the final map and tile plus a checkpoint trail of
+map/tile/facing. The editor was never blind to where it stood.
+
+What it lacked was any explanation of the METRIC. It received score term
+NAMES only — ="goal_state, max_progress, -steps"= — and was asked to
+maximise an integer nothing defined. It knew it was on
+=classic_hearthrock_city= at (23,14); nothing told it that walking onto a
+new map was worth 1000.
+
+*** The fix, and what the model then did with it
+
+=TuxemonRules.describe_progress()= renders the weights in words,
+GENERATED from the same named constants =progress()= sums (=GYM_POINTS=,
+=MAP_POINTS=, =PARTY_POINTS=) so the two cannot drift. =ClaudeEditor=
+takes a =progress_legend=; =cli= passes it for =--objective progress=
+only.
+
+Deliberately says nothing about WHICH maps or where — naming the route
+would hand over the answer, and a win would then show execution rather
+than search. That was the human's explicit choice.
+
+Round 8's winning edit was real search: UP held 64 twice, then A, then
+RIGHT, then A, then LEFT held 128. Its own notes read: "explore UP x2
+(128 steps) then A (interact, in case gym door/NP..." — and it had
+worked out unprompted that edits do not persist between rounds, so it
+must restate the whole action list each time.
+
+The SYSTEM prompt's line "You never see the game" was also corrected: it
+is misleading (the model sees map, tile and facing) and may itself have
+been suppressing the spatial reasoning the task needs.
+
+*** The run then died — from success, not from plateauing
+
+Stop reason: =editor rejected 5 rounds consecutively=, immediately after
+its first win. Two distinct failure modes, both measured:
+
+- *Calls 9-12 returned ZERO characters.* Not truncation — no text block
+  at all. =propose= filters to =type == "text"=, so the generic error
+  "response contains no fenced json block" pointed a reader at a
+  malformed fence when there was no text to fence.
+- *Call 13 was truncated mid-JSON*, ending on ={"=. =EDITOR_MAX_TOKENS=
+  was 4096. This failure is *self-inflicted by success*: an accepted
+  edit grows the script, edits do not persist between rounds, so every
+  later reply must restate a longer list. Round 8's script was 13
+  actions. A cap that shrinks the model's ability to answer as it makes
+  progress is a cap in the wrong place.
+
+And underneath both: =answers.jsonl= recorded only =raw=, so it could
+show that four replies were empty but not why. A file whose only purpose
+is post-hoc diagnosis has to carry enough to be worth reading.
+
+*Fixed:* cap raised to 16384; =stop_reason= and =block_types= recorded
+beside =raw=; empty replies raise a distinct error naming both.
+
+** Demonstrations
+
+| mutation | observed failure |
+|---+---+---|
+| hardcode the party line in =describe_progress= | =AssertionError: "             10  per party member"= (constant patched to 7) |
+| drop the =progress_legend= branch from =build_prompt= | =assert '1,000' in "lead_in: 10 steps..."= |
+| remove the empty-reply guard | =Regex pattern did not match= (raises the fence error again) |
+| record only =raw= | =KeyError: 'stop_reason'= |
+| cap back to 4096 | =assert 4096 >= (4 * 4096)= |
+
+=rules.py= and =claude.py= byte-identical after every restore.
+
+One existing test needed narrowing rather than fixing:
+=test_an_unparseable_reply_is_still_recorded= asserted whole-dict
+equality on the answers record, so it failed when the record grew. What
+it pins is the ORDERING — that the text survives the raise — so it now
+asserts the fields it is about and not the record's shape.
+
+** RELIABILITY, at n=5: it works, and =run5= was the outlier
+
+Three further runs at =run5='s EXACT parameters (24 rounds, patience 14,
+=max_rejections= 6, =max_cost= 8000) were run with nothing else changed.
+
+| run | rounds | first hit | best | editor failures |
+|---+---+---+---+---|
+| =run4= (patience 12, cost 6000) | 14 | round 8 | 1020 | 5 |
+| =run5= | 15 | *never* | 20 | 0 |
+| =run6= | 18 | round 3 | 1020 | 0 |
+| =run7= | 17 | round 2 | 1020 | 1 |
+| =run8= | 19 | round 4 | 1020 | 2 |
+
+*4 of 5 post-legend runs reached 1020; 0 of 4 pre-legend runs did, across
+37 rounds.* At =run5='s exact configuration it is 3 of 4, and the three
+successes first hit at rounds 3, 2 and 4 — fast, not lucky-late.
+=run5= was the outlier, and calling it the rule at n=2 was as premature
+as calling =run4= the rule at n=1.
+
+** A HARD CEILING at 1020, and it is not structural
+
+No run in five ever reached 2020. Every one of the three new winners
+ended on the SAME tile: =classic_gym_granite.tmx= at (10,19), the gym
+entry. They all found the identical move — hold UP from the spawn.
+
+Better scores are available and equally close. =CLASSIC_CRITICAL_PATH=
+ranks =classic_gym_granite= at index 1, but =classic_gym_mila= is index
+2 and =classic_route_1= is index 3, and BOTH are also one hop from the
+start. A run reaching route_1 would score 3020. =_map_index= takes the
+MAX over a run, so a script that enters the gym and then leaves for
+route_1 keeps both — nothing has to be given up.
+
+*I proposed the greedy accept rule as the cause and then measured it,
+which mostly falsified it.* The exits are not equidistant at all:
+
+| exit | tiles from spawn (23,14) | rank | worth |
+|---+---+---+---|
+| =classic_gym_granite= | *1* | 1 | 1020 |
+| =classic_gym_mila= | 6 | 2 | 2020 |
+| =classic_route_8= | 17 | 4 | 4020 |
+| =classic_route_1= | 23 | 3 | 3020 |
+
+Granite is ONE TILE above the spawn. It was not chosen over the others;
+it is the only thing within a single move. "The search locks onto its
+first success" assumed the alternatives were comparably findable, and
+they are not.
+
+*** The real cause: a one-tile-wide target, measured
+
+=gym_mila= is six tiles away, worth 2020, and no run in five found it.
+Sweeping the LEFT hold that walks toward it:
+
+| LEFT hold | lands on tile | max_progress |
+|---+---+---|
+| 64 | x=19 | 20 |
+| *72* | *x=18* | *2020* |
+| *80* | *x=18* | *2020* |
+| 88 | x=17 | 20 |
+
+The door is one tile wide, and the editor must choose a hold duration
+that lands exactly on it. Granite asks for nothing of the sort: any hold
+>= 20 straight up works, with no lateral precision at all. *A forgiving
+target was found by 4 of 5 runs; a one-tile target by none of them.*
+
+That is a property of the ACTION VOCABULARY -- durations in steps, when
+the world is quantised in tiles -- not of the search's willingness to
+explore. The SYSTEM prompt does state "one tile of walking takes 16
+steps", and the checkpoint trail does report tiles, so the information
+needed to correct is present; converting it into an exact hold is what
+does not happen.
+
+Greedy accept may still contribute -- nothing here rules it out -- but it
+is no longer the leading explanation, and it should not be the first
+thing fixed.
+
+*** 2020 is reachable in TWO actions
+
+=test_two_actions_double_the_ceiling_five_live_runs_never_passed=
+(slow) pins it: =LEFT 80= then =UP 48= scores 2020, against the 1020 that
+five live runs never passed. It also pins the one-tile window, asserting
+that 64 and 88 both score 20.
+
+So the ceiling is a property of the search, not of the map or the
+scoring, and the bar a future change has to clear is now written down and
+checked on every run. Demonstrated by ranking =classic_gym_mila= off the
+critical path: =AssertionError: assert 20 == 2020=.
+
+** Superseded: the n=2 reading
+
+A second run (=run5=), same save, same objective, 15 rounds, patience 14,
+=max_cost= 8000: *every round scored 20.0* and it stopped on patience
+exhausted. Round 8 did not reproduce.
+
+| | rounds | reached >20 | editor failures |
+|---+---+---+---|
+| before the legend (4 runs) | 37 | 0 | 5 |
+| =run4=, after the legend | 14 | 1 (round 8) | 5 |
+| =run5=, after robustness | 15 | 0 | *0* |
+
+So the honest statement is: explaining the metric made a success POSSIBLE
+where 37 rounds had produced none, and then a further 30 rounds produced
+exactly one. *That is weak evidence of improvement, not a working
+search.* I called it "the hypothesis was right" on n=1, which was
+premature; this table is the correction.
+
+The two claims separate cleanly and only one is established:
+
+- *The robustness fix is VALIDATED.* =run5= had ZERO editor failures
+  across 15 rounds against =run4='s five. Every =stop_reason= came back
+  =end_turn=, the longest reply was 3058 characters — well inside the
+  raised cap — and =answers.jsonl= now carries =stop_reason= and
+  =block_types= on every row.
+- *The search is NOT established.* One hit in 30 rounds is
+  indistinguishable from luck at this sample size, and nothing here
+  measures whether the legend caused it.
+
+What that suggests next, in order of what it would actually settle:
+repeat =run5= two or three times to get a real hit rate before changing
+anything else; the LLM's sampling is the dominant variable and n=2 cannot
+see past it. Only then is it worth asking whether the editor needs the
+map's exits (the option deliberately declined earlier, precisely so a win
+would demonstrate search rather than execution).
+
+*Gate:* =make check= =EXIT=0=, 479 passed / 4 skipped / 11 warnings in
+267.64s; slow 5 passed; ruff + =lint-patched= + mypy (83 files) clean.
+Load 3.2 → 4.7, so this timing IS comparable to the 268.41s figure.
+472 → 479 (+7).
+
+* The 1020 ceiling, finally explained — a held button does not survive a map transition
+
+*I proposed three causes for this ceiling and measured all three. The
+first two were wrong.* Recorded in order, because the sequence is the
+useful part:
+
+1. "Greedy accept locks onto the first success." *Falsified:*
+   =classic_gym_granite= is ONE TILE above the spawn while =gym_mila= is
+   6 and the routes 17-23. It was not preferred, it was the only thing
+   within one move.
+2. "A one-tile-wide door needs hold precision the editor cannot manage."
+   *True but not the cause.* It IS one tile wide (LEFT hold 72-80 lands
+   on it, 64 and 88 miss), but the runs were never trying for it.
+3. "Feedback density." *Falsified by experiment:* three runs at
+   =--checkpoint 16= (one snapshot per tile) against four at the default
+   64. Both groups: reached 1020, never exceeded it.
+
+| checkpoint | reached 1020 | exceeded 1020 |
+|---+---+---|
+| 64 (4 runs) | 3 | *0* |
+| 16 (3 runs) | 3 | *0* |
+
+** What the runs were actually doing — read their own notes
+
+They were not failing to find =gym_mila=. They were *correctly ignoring
+it.* =RulesObjective.TERMS= is =(goal_state, max_progress, -steps)= and
+=goal_state= dominates lexicographically, so winning a battle beats any
+amount of map progress. Having entered a gym, trying to fight its leader
+is the right play and walking off to another map for +1000 would be
+strictly worse.
+
+Their notes say so plainly. From =run9=: "confirms A alone from that
+position/distance isn't immediately resolving". From =run10=: "clearly
+insufficient... added 20 more A presses to push through leader dialogue".
+From =run11=: "confirmed gym_granite corridor y=19: x=9-11 walkable, wall
+x=12 east, north blocked at x=10".
+
+They were pressing A at a leader who was thirteen tiles away.
+
+** The mechanic
+
+*Entering a map with a button still held leaves the player frozen on the
+entry tile.* Measured:
+
+| input | ends |
+|---+---|
+| UP held continuously, 1600 steps | =gym_granite= (10,19) — frozen |
+| UP 40, RELEASE, UP again | =gym_granite= *(10,6)* |
+| repeated fresh UP presses | =gym_granite= *(10,6)* |
+
+(10,6) is the =start_battle= tile. The gym door is one tile above the
+spawn, so the single cheapest move in the game — hold UP — is *exactly*
+the move that walks in and freezes. Every run found it, and it is a trap.
+
+A second consequence: after a transition each action advances exactly ONE
+tile regardless of =hold=, where the same hold walks several tiles in the
+town. Thirteen tiles needs thirteen actions, not one long hold.
+
+** Nothing is broken, and the goal is fully reachable
+
+Driving it manually with fresh press edges: step 901 =DialogState= (the
+leader's =pre_battle= talk), step 981 *=CombatState=* — a real gym battle
+— step 1378 =MainCombatMenuState=, step 2781 =LevelUpSummaryState=. The
+trigger is =behav1: talk classic_gym_leader_granite=, an interaction, not
+a step-on, and =cond1= is =not battle_outcome player,won,...=, so it
+fires once.
+
+So the path from the committed save to a gym battle is traversable with
+the vocabulary that already exists. What blocks the optimizer is one
+mechanic it has no way to learn about.
+
+=test_a_held_button_does_not_survive_a_map_transition= (slow) pins all
+three measurements: one action → (10,19) frozen, two → (10,18) one tile,
+fourteen → (10,6).
+
+*Gate:* =make check= =EXIT=0=, 481 passed / 4 skipped / 11 warnings in
+278.51s; slow 7 passed; ruff + =lint-patched= + mypy (83 files) clean.
+
+** What this implies for the next change, stated as options not a plan
+
+The editor cannot discover this from the prompt: nothing tells it that a
+held button dies at a map edge, and the checkpoint trail shows a frozen
+tile without saying why. Three candidates, none yet chosen:
+
+- Say it in the SYSTEM prompt — one sentence, cheapest by far, and
+  testable against the same seven-run baseline.
+- Make =seal= inject a release edge on every map change, so the harness
+  removes the trap rather than documenting it. Changes replay semantics
+  and needs care against the trace format.
+- Leave it. It is arguably a real skill the benchmark should measure.
+
+* THE REAL CAUSE: the objective punishes the only route to its own goal
+
+Nine live runs, five proposed explanations, four of them wrong. This one
+is measured directly from the round logs rather than inferred.
+
+** The evidence, from =run13='s log
+
+Rounds 6 through 19 — *fourteen consecutive candidates* — every one
+scoring =[0.0, 1020.0, -steps]= and every one REJECTED. Not for being
+wrong. For being LONGER.
+
+: r 5  score=[0.0, 1020.0, -1000.0]  acc=True     <- accepted, stops at the door
+: r 6  score=[0.0, 1020.0, -1252.0]  acc=False
+: r 7  score=[0.0, 1020.0, -1344.0]  acc=False
+: ...
+: r19  score=[0.0, 1020.0, -1240.0]  acc=False
+
+The model was walking further into the gym each time. The objective threw
+every attempt away.
+
+** Why
+
+=RulesObjective.TERMS= is =(goal_state, max_progress, -steps)=. Every
+tile inside =classic_gym_granite= is rank 1 of the critical path, so
+walking its thirteen-tile corridor leaves =max_progress= at exactly 1020
+and makes =-steps= strictly worse. *Among candidates tied on progress the
+objective prefers the one that steps through the door and stops.*
+
+Only =goal_state= outranks that, and the battle cannot be reached without
+first paying the thirteen tiles the objective refuses to pay for. The
+approach to the goal is a region of pure cost with no intermediate
+reward, and the search is behaving correctly inside a scoring function
+that forbids the approach.
+
+** The four explanations that were wrong, in order
+
+| # | proposed | verdict |
+|---+---+---|
+| 1 | greedy accept locks onto the first success | *false* — granite is 1 tile away, mila 6, routes 17-23. Not preferred; the only thing in reach. |
+| 2 | a one-tile door needs hold precision | *true but irrelevant* — the runs were never trying for mila. |
+| 3 | feedback density | *false* — 3 runs at =--checkpoint 16= vs 4 at 64. Both reached 1020, neither exceeded it. |
+| 4 | an unlearnable engine mechanic | *true, and stated in the prompt* — held buttons do die at map transitions. Two further runs still stalled, because #5 vetoes acting on it. |
+
+*The prompt sentence (#4) never got a fair test.* It may well have
+worked: =run12= and =run13= produced longer, deeper walks than any
+earlier run. The objective rejected all of them. That change cannot be
+evaluated until the shaping is fixed, and calling it a failure now would
+be a fifth wrong conclusion.
+
+** Pinned as a test that is EXPECTED TO FAIL once fixed
+
+=test_walking_toward_the_goal_scores_WORSE_than_stopping_at_the_door=
+(slow) asserts the trap: one =UP= action and fourteen =UP= actions both
+score =max_progress= 1020, and the fourteen-action approach scores
+strictly worse. When a future objective makes the approach pay, this test
+breaks — deliberately. It is a statement of the current defect, not of
+desired behaviour.
+
+*Gate:* =make check= =EXIT=0=, 483 passed / 4 skipped / 11 warnings in
+267.98s; slow 8 passed; ruff + =lint-patched= + mypy (83 files) clean.
+
+** What would fix it — options, not a plan
+
+- *Drop =-steps= from =RulesObjective=.* One line. Removes the veto
+  outright, at the cost of any pressure toward short traces — and short
+  traces are much of the point of an optimizer.
+- *Only apply =-steps= once =goal_state= is reached.* Keeps the pressure
+  where it belongs (shortening a WINNING run) and removes it while the
+  goal is still unreached.
+- *Make progress finer than a map rank* — distance to the nearest
+  unvisited objective, say — so the corridor pays as it is walked. The
+  most faithful shaping and the largest change.
+
+The second looks right to me and is nearly as small as the first, but
+this is a decision about what the benchmark rewards, so it is the
+human's.
+
+* Option 2 implemented — and it needed a second half to work at all
+
+The human chose "apply =-steps= only once =goal_state= is reached" from
+the three options. Implemented, plus one companion change that was NOT
+in the option as offered, because option 2 alone is *inert*.
+
+** Half one: =RulesObjective= stops punishing the approach
+
+=score= now returns a flat =0.0= for the step term while =goal_step= is
+None, and =-steps= only once the goal is reached. The class docstring has
+claimed exactly this since it was written ("among goal-reaching
+candidates, fewer steps wins"); the code applied =-steps= to everything.
+*The intent was already right and the implementation never matched it.*
+
+Written against =goal_step= rather than the score's first term so a DEAD
+candidate is also spared: it already loses on term 0 to everything alive,
+and ranking one corpse above another by length answers a question nobody
+asked.
+
+** Half two: =optimize= adopts a TIE while the goal is unreached
+
+Measured immediately after half one, with an editor appending one UP
+action per round:
+
+: ROUND proposing on a 0-action script, score=(0.0,   20.0, 0.0)
+: ROUND proposing on a 1-action script, score=(0.0, 1020.0, 0.0)
+: ROUND proposing on a 1-action script, score=(0.0, 1020.0, 0.0)
+: ... eight rounds, never past ONE action ...
+: RESULT best_round=1 best actions=1
+
+Neutralising =-steps= stops the objective PUNISHING an approach, but
+strict =>= then discards it for merely TYING. The script cannot grow, so
+the thirteen tiles to the leader are never walked, so the goal that would
+break the tie stays unreachable. *Option 2 as offered would have shipped
+inert*, and that is worth recording: the option was mine to describe and
+I described it without checking the acceptance rule.
+
+=optimize= now adopts a tie when the objective is a =RulesObjective= and
+=goal_step= is None. Scoped deliberately: =ReachTile= scores =-steps=
+unconditionally and keeps strict =>=. A tie still counts toward
+=patience=, so an exploring run terminates on the same bound as any
+other.
+
+** After both halves, the walk happens
+
+Same appending editor, after the fix:
+
+| round | tile |
+|---+---|
+| 1 | (10,19) — the entry, where nine runs stopped |
+| 2 | (10,18) |
+| 3 | (10,15) |
+| 4 | (10,12) |
+| 5 | (10,9) |
+| 6 | *(10,6)* — the leader's tile, where =start_battle= fires |
+
+** A vacuous test, caught by its own demonstration
+
+The first runner test for half two asserted that a NON-=RulesObjective=
+run does not grow. Reverting the =explores= branch left it *passing* —
+because that case does not grow either way. It pinned the scoping and
+nothing else, while being named for the adoption.
+
+Renamed to =test_tie_adoption_is_scoped_to_RulesObjective=, and the
+adoption is now pinned by
+=test_the_script_can_grow_toward_the_goal= (slow), which needs a real
+=goal_step= and so runs a real seal. Reverting the branch fails it.
+That makes seven vacuous tests this project has caught by demonstrating
+them rather than trusting them.
+
+** Still not a win, and a new engine defect
+
+=goal_step= remains None. The battle DOES begin — the engine logs
+=add_monster= for the gym leader — but it also logs, repeatedly:
+
+: Error in event listener for 'monster_added' (_on_monster_added):
+: Missing layout key 'monster_box_home' for NPC Gym Leader Granite
+
+An upstream defect in the vendored tree, unrelated to anything this
+project changed, and a plausible reason a completed battle is never
+recorded through =record_battle=. NOT investigated further. It is the
+next thread, and it is an engine question rather than a search one.
+
+*Gate:* =make check= =EXIT=0=, 485 passed / 4 skipped / 11 warnings in
+319.62s; slow 9 passed; ruff + =lint-patched= + mypy (83 files) clean.
+Load ~4.1.
+
+*Demonstrations:* =-steps= made unconditional again → =assert -60.0 ==
+-840.0=; strict => restored → the growth test fails on a one-action
+script. =objective.py= and =runner.py= byte-identical after each restore.
+
+*Untested against a live model.* The nine-run baseline all stalled at
+1020 with zero battles; whether a real editor now walks the corridor is
+unmeasured.
+
+* S6 — browser play with a ghost, delivered (acceptance PARTIAL)
+
+*Top line, so nobody has to read to the bottom:* it builds, it runs, a
+human played it. The ghost is drawn, in the right place, and provably
+does not perturb the digest — and it FAILED to communicate anything to
+the first human who saw it. See "The two human checks" below.
+
+*AS OF 2026-08-31 THE SHIPPED PAGE HAS NO GHOST.* It is plain play. The
+ghost is off by DEFAULT, not removed: every ghost path still exists and
+is still tested, and one argument turns it back on. See "And then the
+human turned the ghost OFF" below. Everything between here and there
+describes the ghost as it was accepted, which is still what you get if
+you pass one.
+
+A local browser build: Pyodide runs the real engine, a human plays with
+their arrow keys, and a ghost — a previously recorded run replayed as a
+translucent NPC — walks beside them.
+
+Scope was cut deliberately by the human, and each cut is a clean second
+increment rather than rework: *play only* (no traces written, so the
+format's =platform=/=patch_series_id= guarantees are untouched), *one
+fixed scenario* (=paper_town.save= + =scripted_town_1234= as the ghost),
+*local only* (=make web=, then =make serve= on port 8777).
+
+Feasibility was measured BEFORE any of it was designed —
+=docs/2026-08-30-wasm-spike.org=.
+
+** NO seventh patch. The series stays at SIX.
+
+The obvious implementation deferred =base_client.py='s module-level
+=NetworkManager= import (it pulls in =ssl=, which browsers lack) as patch
+0007. Measured: unnecessary. A Python-level =ssl= shim in
+=tuxghost/web.py= is sufficient against an otherwise unmodified engine.
+
+That mattered far more than the lines it saved. =patch_series_id()=
+digests =patches/*.patch=; a seventh patch stales THREE golden fixtures
+at once, one of which is the ghost this subsystem plays, and
+=tests/conftest.py= turns that into a failure on purpose.
+
+The shim is =try/except ImportError=, NOT =setdefault=: Pyodide ships a
+real =ssl=, and a hollow one provably breaks =websockets.asyncio.client=
+with =AttributeError: module 'ssl' has no attribute 'SSLWantReadError'=.
+
+** What shipped
+
+| file | what |
+|---+---|
+| =tuxghost/web.py= | =boot()=, =step_once()= (synchronous, gate-tested), =async main()= |
+| =tests/test_web.py= | 8 tests |
+| =tests/test_build_web.py= | 3 tests |
+| =web/index.html= | ~20-line Pyodide shim + a steps/sec readout |
+| =scripts/build_web.py= | packages =build/web/= |
+| =Makefile= | =web= target; =scripts= added to =lint= and =types= |
+
+=step_once= holds every decision — pacing, catch-up, ghost advance,
+blit/flip — and runs natively under =make check=. =main='s only
+browser-specific line is the =await=.
+
+** MANUAL ACCEPTANCE — four of five checks verified by machine
+
+Driven in real headless Chromium against the real =make web= output.
+
+| check | result |
+|---+---|
+| 1 page boots | *PASS* — canvas appears, no page errors |
+| 2 the map DRAWS | *PASS* — real tiles, sprites, buildings, water, fence, trees. NOT a fill. |
+| 3 arrow keys move the player | *PASS* — camera scrolls on held Down, then Right |
+| 4 ghost walks its route and stops | *PASS* — =npc_manager.npcs= = ghost, npc_red, spyder_papertown_silver, spyder_sign; ghost at (16,14), its known finish tile; player at (12,12) |
+| 5 >= 30 steps/sec sustained | *PASS* — 60.0, re-read 59.9, re-read 60.0 |
+
+*Check 2 was this subsystem's largest unverified risk.* Every earlier
+claim rested on the spike having drawn a =fill= to a canvas; a real game
+frame had never been rendered in a browser until this run.
+
+*Check 5's number measures the GAME LOOP, not paints.* The first
+implementation counted =requestAnimationFrame=, which ticks at ~60fps
+whether or not the Python loop advances — it would have read 60 on a
+stalled build. Caught in review and replaced with the loop's own step
+count per wall-clock second, pinned by a test that fails when a stalled
+loop keeps reporting 60.
+
+Identifying the ghost required querying =npc_manager= directly: it wears
+the PLAYER's own sprite by design, so visually it is one of several
+similar figures. That query needed one line of instrumentation on the
+BUILT page (=pyodide= is a local in the shim's IIFE);
+=web/index.html= source was never touched and =make web= overwrote it.
+
+** The two human checks: PARTIAL PASS, 2026-08-30
+
+Performed by the human against the real build.
+
+*Check A — does it feel responsive: PASS.* Their words: "it works".
+
+*Check B — does the ghost read as a translucent "another you": FAIL.*
+Their words, unprompted and on first sight: *"why is there a random
+ghost there?"*
+
+The ghost was visible, in the right place, and behaving exactly as
+designed. It still did not communicate anything. Three causes, all
+independently true and all compounding:
+
+1. *The walk is over before anyone looks.* The trace is 176 steps — under
+   three seconds at 60 steps/sec — while boot takes a minute or more. The
+   human sees the aftermath, never the motion.
+2. *It then stands at its finish tile forever.* That behaviour was chosen
+   deliberately (see "Defect 1" in S4's acceptance section) over hiding
+   it, and the choice was right — hiding is exactly why S4's ghost went
+   unnoticed across three subsystems. But "waiting at its finish line
+   like a racing ghost" reads as "a motionless stranger" to someone who
+   missed the race.
+3. *It wears the PLAYER's own sprite* by design, so it looks like a
+   duplicate of you rather than something distinct. That choice came from
+   S5's whole-branch review (M1), which corrected a hardcoded
+   =sprite_slug= back to the spec's "another you" requirement. The spec's
+   intent was right; the result is illegible without motion to explain it.
+4. *The fixture is not a playthrough.* =scripted_town_1234= is a test
+   trace recorded to exercise the replay machinery: it walks six tiles
+   and stops, because that is all it was ever asked to do.
+
+*So: mechanically correct, experientially thin.* Recorded as a PARTIAL
+pass rather than a pass, deliberately. S4 was marked done while three
+defects were live, and most of 2026-08-30 was spent paying for that; a
+green mark here for a feature the human could not interpret would be the
+same mistake in a new place.
+
+*What would actually fix it, in the order likely to help most:* a longer,
+purposeful ghost trace; a visual marker or distinct sprite so it reads as
+A GHOST rather than a clone; and a start delay or replay loop so the walk
+happens while somebody is watching.
+
+*** The first of those is DONE, and it is not enough
+
+The shipped ghost is now =claude_town_1234= (442 steps) rather than
+=scripted_town_1234= (176). It wanders — (12,12) → (14,12) → … → (11,14)
+— where the old one walked a short, near-straight line.
+
+*It does not solve the problem, and saying so plainly matters more than
+the improvement.* Measured on the new trace: the ghost stops moving
+around *step 200*, roughly 3.3 seconds in, because the recorded run
+entered NPC dialogue there and stood still. Boot still takes over a
+minute. A human still arrives after the motion has ended and still finds
+a stationary figure.
+
+So this bought richer movement for whoever happens to be watching in the
+first few seconds, and nothing at all for anyone who is not.
+
+*** The loop is DONE, and this one should actually work
+
+=advance_ghost= gained =loop: bool = False=, and the browser passes
+=loop=True=. Past the end of its track the ghost now replays from the top
+instead of standing still, so it is moving whenever anybody looks —
+which is the first change here that addresses the actual complaint rather
+than an adjacent one.
+
+*OPT-IN, not the default, and deliberately so.* =tuxghost.play= still
+lingers. A native window plausibly has the same problem — its user also
+arrives after boot — but this function has already carried one reversal
+(hide → linger, S4's acceptance), and changing a documented behaviour by
+side effect is exactly how that one got expensive. Adopting =loop=True=
+for =play= should be a decision somebody makes on purpose.
+
+*What looping costs, stated rather than hidden:* lingering is honest —
+the ghost walked its route once and stopped where it stopped. Looping
+shows a run repeating that happened once. That is a presentational
+liberty, the same one a racing game takes when a ghost car reappears each
+lap, and it is a liberty rather than a fact.
+
+Both behaviours are pinned: removing the loop branch fails
+=test_loop_replays_the_track_instead_of_lingering= with
+=assert (16, 14) == (12, 12)=, and flipping the default fails
+=test_lingering_is_still_the_default= with =assert (12, 14) == (16, 14)=.
+
+*Still unimplemented:* a marker or distinct sprite, so the ghost reads as
+A GHOST rather than a second you. That was the other half of the
+complaint and nothing here touches it.
+
+*** And then the human turned the ghost OFF, 2026-08-31
+
+Asked for, and done: =web/index.html= now calls =web.main= with a save
+and no trace at all. The shipped page is plain play.
+
+*This is a default change, not a deletion, and the distinction is the
+whole point.* =boot= and =main= still take a =ghost: Path | None=;
+=build_track=, =install_ghost= and =advance_ghost= are all still there,
+still reached, and still pinned by the same four ghost tests in
+=tests/test_web.py= that passed before this change. Hand =boot= a trace
+and the ghost is back, looping, exactly as it was. What changed is which
+behaviour a person gets when nobody asks for one.
+
+Why that is the honest default *for now*: the ghost's own acceptance
+above records a human, on first sight, asking "why is there a random
+ghost there?" Two of the three identified fixes shipped and the third —
+a marker or distinct sprite — did not. Showing a figure nobody can
+interpret is worse than showing none, and leaving it on by default while
+the STATUS entry says it is illegible would be the same kind of
+optimistic green mark S4 already cost a session for.
+
+*What it costs, stated rather than hidden:* the ghost is now the least
+exercised part of this subsystem at the only place it was ever seen
+running — a real browser. The native tests do not notice, which is
+exactly the shape of gap this project keeps finding.
+
+Three defects, each demonstrated failing before the fix was trusted:
+- =step_once= without the =npc is None= guard →
+  =AttributeError: 'NoneType' object has no attribute 'at'=.
+- =boot= with a default ghost path restored →
+  =AssertionError: <tuxemon.entity.npc.NPC object at 0x11013af60> is None=.
+- =web/index.html= naming a fixture =_zip_fixtures= no longer packs →
+  =AssertionError: assert 2 == 1=, in =tests/test_build_web.py=.
+
+That last one is why the ghost trace is no longer packed into
+=fixtures.zip= at all: the page's =Path(...)= literals and the zip's
+arcnames are pinned EQUAL, so a fixture the page never names is not
+harmless dead weight, it is a failing test. Putting the ghost back is
+two lines — =web/index.html= and =scripts/build_web.py= — and nothing
+under =tuxghost/=.
+
+=make check=: 504 passed fast, 9 slow, ruff + lint-patched + mypy clean.
+
+** What is NOT covered — stated plainly
+
+- *The browser cannot verify trace provenance.* Measured during
+  acceptance: it computes =patch_series_id = sha256:e3b0c442...=, which
+  is the sha256 of EMPTY INPUT, because =patches/= ships in no zip and
+  the glob matches nothing. Every trace read in the browser therefore
+  warns =patch_series_id differs=. Warn-not-refuse, so nothing breaks,
+  and for a play-only build it is arguably correct that provenance is
+  uncheckable — but the spec claimed no such limitation. (The sibling
+  =platform= warning, macOS vs =Emscripten-4.0.9-wasm32-32bit=, is
+  expected.)
+- *Audio.* 143 music files ship as zero bytes; whether PLAYING one raises
+  is untested. The spec's stated fallback — disable audio in the browser
+  build — has no switch anywhere in the code.
+- *Busy-map frame cost.* The scenario is Paper Town.
+- *Input latency.* Keys arrive; how promptly is unmeasured.
+- *=pygame-ce= version gap*: 2.5.6.dev2 in Pyodide vs the pinned 2.5.7.
+- *Pyodide boot and the async wrapper* have no native test. That surface
+  is small, and the acceptance above is its compensating control.
+
+** A test that was green for the wrong reason
+
+=tests/test_web.py= originally set no SDL drivers. It passed only because
+~13 alphabetically-earlier test files call =headless_context()=, which
+sets them as a side effect — so running that file ALONE opened a real
+window, and it would fail on a display-less machine. Found by the
+whole-branch review; fixed by setting both vars at the top of the file,
+verified by re-running with the variables deliberately BLANKED.
+
+Worth recording because the controller's own resource ruling had
+instructed implementers to run exactly that file alone.
+
+* Next subsystem
+
+*S5* (finish lines / rewards) follows S4.
+
+Each subsystem gets its own spec. This project's original spec covered
+only S1 (the trace/replay core); S2 (the CU-agent harness) and S3 (the
+offline optimizer) each have their own, both now =#+STATUS: implemented=.
+
+S5 is where =ReachTile= gets replaced rather than extended: it supplies
+its own =Objective= and nothing in S3's loop, seal or edit vocabulary
+changes.
+
+*This paragraph is now PARTLY FALSE and is corrected here rather than
+left standing, per this project's own rule against silently outdated
+claims.* S5 shipped (see "S5 — progress rules and vgbench export,
+delivered" above) and it is not true that nothing in S3's loop or seal
+changed: =tuxghost/optimize/seal.py='s =seal()= gained a per-step
+=rules= observer parameter, and =CandidateResult= gained three fields
+(=max_progress=, =goal_step=, =died=) that the observer populates. What
+survives from the original claim is the *edit-vocabulary* half only —
+=lift=, =edits= and the editors (=MutationEditor=, =ClaudeEditor=) are
+untouched by S5. The *runner's comparison logic* is also genuinely
+unchanged: =tuxghost/optimize/runner.py='s scoring comparison at
+:217/:297 does not know or care that =RulesObjective= exists, because
+=RulesObjective= satisfies the same =Objective= protocol =ReachTile=
+does — =rules= is threaded through as an optional parameter that
+=seal()= and =optimize()= pass along, not a new comparison path.
+
+*The argument for S5 changed during Stream A, and the old wording here
+was left standing too long.* This section used to say that a positional
+objective "could not improve position at all" on the only parent the
+project had. That was true of =claude_town_1234=, whose trailing dialogue
+swallowed every appended input — and it is *false now*. Against
+=scripted_town_1234=, =MutationEditor= reaches the target tile in two of
+three seeds and =ClaudeEditor= in three of three (see "A4 — measured,
+both sides"). =ReachTile= works.
+
+So S5's case is no longer "the positional objective is inert". It is the
+narrower and more honest one: *position is a proxy for progress, and
+this project has never measured progress.* =ReachTile='s own docstring
+has said exactly that from the start — it "measures position, not
+progress: it says nothing about whether the game advanced". A finish-line
+objective is what tests that claim, and nothing in S3 has to change for
+it to be tried.
